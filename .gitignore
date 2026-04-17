@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+dj-lights-mvp2/cache/
+
+# Personal Claude Code settings — contains an API key.
+.claude/settings.local.json
+
+# Runtime artifacts
+logs/
+tracks.log
+nohup.out
+*.log
+
+# Pioneer rekordbox exports
+databases/

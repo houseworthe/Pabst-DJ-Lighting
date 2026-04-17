@@ -1,0 +1,429 @@
+{
+  "version": 1,
+  "scenes": [
+    {
+      "id": "intro-starry-breathe",
+      "name": "Snowflake",
+      "category": "intro",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18322
+          }
+        },
+        {
+          "type": "strobe",
+          "target": "all",
+          "rgb": [
+            255,
+            255,
+            255
+          ],
+          "amber": 0,
+          "dim": 4,
+          "rate": 17
+        }
+      ]
+    },
+    {
+      "id": "groove-amber-wash",
+      "name": "Aurora",
+      "category": "groove",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18318,
+            "H6010": 3275
+          }
+        }
+      ]
+    },
+    {
+      "id": "buildup-chase",
+      "name": "Building Chase",
+      "category": "buildup",
+      "layers": [
+        {
+          "type": "chase",
+          "colors": [
+            [
+              255,
+              0,
+              0
+            ],
+            [
+              255,
+              122,
+              51
+            ]
+          ],
+          "amber": 0,
+          "rate_hz": 5.7,
+          "dim_active": 7,
+          "dim_rest": 0
+        },
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18328,
+            "H6010": 3278
+          }
+        }
+      ]
+    },
+    {
+      "id": "breakdown-deep-purple",
+      "name": "Deep Purple",
+      "category": "breakdown",
+      "layers": [
+        {
+          "type": "breathe",
+          "target": "all",
+          "amber": 0,
+          "hz": 0.25,
+          "dim_min": 4,
+          "dim_max": 12,
+          "strobe": 0,
+          "colors": [
+            [
+              40,
+              0,
+              90
+            ]
+          ]
+        },
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18383,
+            "H6010": 1260
+          }
+        }
+      ]
+    },
+    {
+      "id": "drop-pulse-party",
+      "name": "Pulse Party",
+      "category": "drop",
+      "layers": [
+        {
+          "type": "pulse",
+          "target": "all",
+          "colors": [
+            [
+              255,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              255
+            ],
+            [
+              255,
+              0,
+              180
+            ],
+            [
+              0,
+              255,
+              180
+            ]
+          ],
+          "amber": 0,
+          "on_ms": 80,
+          "off_ms": 40,
+          "dim": 64,
+          "strobe": 0
+        },
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18351,
+            "H6010": 3282
+          }
+        }
+      ]
+    },
+    {
+      "id": "outro-sunset-fade",
+      "name": "Sunset Fade",
+      "category": "outro",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18312
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-875n2osl",
+      "name": "Meteor",
+      "category": "drop",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18316
+          }
+        },
+        {
+          "type": "random_flash",
+          "target": "all",
+          "rgb": [
+            255,
+            255,
+            255
+          ],
+          "amber": 0,
+          "dim": 234,
+          "min_gap_s": 6,
+          "max_gap_s": 12,
+          "double_chance": 10,
+          "flash_ms": 77
+        }
+      ]
+    },
+    {
+      "id": "scene-v4gpkr9d",
+      "name": "Meteor Shower",
+      "category": "drop",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18317
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-2r226xu5",
+      "name": "Siren ",
+      "category": "drop",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18379
+          }
+        },
+        {
+          "type": "strobe",
+          "target": "all",
+          "rgb": [
+            255,
+            0,
+            0
+          ],
+          "amber": 0,
+          "dim": 10,
+          "rate": 153
+        }
+      ]
+    },
+    {
+      "id": "scene-j7qbmyf8",
+      "name": "Downpour",
+      "category": "buildup",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18340
+          }
+        },
+        {
+          "type": "random_flash",
+          "target": "all",
+          "rgb": [
+            20,
+            59,
+            255
+          ],
+          "amber": 0,
+          "dim": 223,
+          "min_gap_s": 4,
+          "max_gap_s": 8,
+          "double_chance": 10,
+          "flash_ms": 36
+        }
+      ]
+    },
+    {
+      "id": "scene-2a9sjdm6",
+      "name": "Bulb Rainbow",
+      "category": "intro",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H6010": 3276
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-tw01aars",
+      "name": "Fire",
+      "category": "outro",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18328,
+            "H6010": 3278
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-vpmq8unp",
+      "name": "Glacier",
+      "category": "buildup",
+      "layers": [
+        {
+          "type": "random_flash",
+          "target": "all",
+          "rgb": [
+            18,
+            85,
+            243
+          ],
+          "amber": 0,
+          "dim": 58,
+          "min_gap_s": 1,
+          "max_gap_s": 6,
+          "double_chance": 30,
+          "flash_ms": 80
+        },
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18334
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-6z7dunn3",
+      "name": "Racing Game",
+      "category": "breakdown",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H6010": 3294
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-97gxk3e4",
+      "name": "Stacking",
+      "category": "breakdown",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18405
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-2nrg2stt",
+      "name": "Energetic",
+      "category": "groove",
+      "layers": [
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18397,
+            "H6010": 3286
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-f7q9ig0j",
+      "name": "Candy Cane",
+      "category": "groove",
+      "layers": [
+        {
+          "type": "chase",
+          "rgb": [
+            138,
+            25,
+            25
+          ],
+          "amber": 0,
+          "rate_hz": 0.9,
+          "dim_active": 37,
+          "dim_rest": 0,
+          "colors": [
+            [
+              255,
+              0,
+              0
+            ],
+            [
+              255,
+              255,
+              255
+            ]
+          ]
+        },
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18363
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-b1ocymwr",
+      "name": "Ghost",
+      "category": "drop",
+      "layers": [
+        {
+          "type": "breathe",
+          "target": "all",
+          "colors": [
+            [
+              0,
+              0,
+              255
+            ],
+            [
+              255,
+              255,
+              255
+            ],
+            [
+              129,
+              0,
+              214
+            ]
+          ],
+          "amber": 0,
+          "hz": 1.29,
+          "dim_min": 0,
+          "dim_max": 57
+        },
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H61E5": 18349
+          }
+        }
+      ]
+    }
+  ]
+}
