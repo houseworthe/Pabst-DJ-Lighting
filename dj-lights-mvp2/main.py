@@ -52,7 +52,10 @@ VCDJ_PLAYER_NUMBER = 17
 # link-local auto-assigns a new IP on each interface bringup, so pick en8's
 # current address at runtime rather than hardcoding.
 PREFERRED_IFACE_NAME = "en8"
-PDB_PATH = os.path.abspath(os.path.join(BASE, "..", "dj-lights", "databases", "player-1-sd.pdb"))
+# prodj's PDBProvider writes to "databases/player-{pn}-{slot}.pdb" relative to
+# CWD ([pdbprovider.py:52](../dj-lights/python-prodj-link/prodj/data/pdbprovider.py:52)).
+# We launch from the repo root, so the file lands at <repo>/databases/.
+PDB_PATH = os.path.abspath(os.path.join(BASE, "..", "databases", "player-1-sd.pdb"))
 
 _state_lock = threading.Lock()
 _active_deck: Optional[int] = None
@@ -60,6 +63,23 @@ _active_track_by_deck: dict[int, int] = {}
 _analysis_by_track: dict[int, dict[str, Any]] = {}
 _pssi_cache: dict[int, dict[str, Any]] = {}
 _last_mode: Optional[str] = None
+# Per-deck, the track_id we last committed to when that deck became active.
+# Flap-back guard: once we've flipped to a (deck, track_id) we won't flip to
+# it again during this track — a brief pause on the outgoing deck can't
+# bounce us between tracks. The next flip requires a NEW track loaded.
+_committed_track_by_deck: dict[int, int] = {}
+
+# Fire mode changes this many milliseconds BEFORE the beat boundary so lights
+# lead the transition instead of lagging it. Converted to a beat offset on each
+# tick using the live BPM.
+SCENE_LOOKAHEAD_MS = 1000
+
+# If the active deck stops playing for this long without another deck picking
+# up, blackout. Guards against the lights freezing on (say) the last outro
+# mode after the DJ just... stops. Crossfades are unaffected — the hysteresis
+# in on_client_change promotes the incoming deck before the timer expires.
+PAUSE_BLACKOUT_S = 5.0
+_pause_since: Optional[float] = None
 
 prodj: Optional[ProDj] = None
 
@@ -123,15 +143,12 @@ def fetch_pssi(loaded_player_number: int, slot: Any, track_id: int) -> Optional[
 def load_track(deck: int, loaded_player_number: int, slot: Any, track_id: int, metadata: dict) -> None:
     pssi = fetch_pssi(loaded_player_number, slot, track_id)
     if pssi is None:
-        pssi = {
-            "mood": "low",
-            "phrases": [
-                {"type": 1, "start_beat": 0, "end_beat": 32},
-                {"type": 2, "start_beat": 32, "end_beat": 96},
-                {"type": 5, "start_beat": 96, "end_beat": 160},
-                {"type": 7, "start_beat": 160, "end_beat": 192},
-            ],
-        }
+        # No synthesized fallback — a generic intro/groove/drop/outro template
+        # drives every track into the same phrase boundaries and hides the
+        # real failure. Skip the track; on_client_change will keep whatever
+        # mode was last dispatched until a track with real PSSI loads.
+        print(f"[track] deck={deck} id={track_id} — PSSI unavailable, skipping", flush=True)
+        return
     track = {
         "track_id": str(track_id),
         "title": metadata.get("title", "Unknown"),
@@ -151,7 +168,7 @@ def load_track(deck: int, loaded_player_number: int, slot: Any, track_id: int, m
           flush=True)
 
 
-def section_for_beat(phrases: list[dict], beat: int) -> Optional[dict]:
+def section_for_beat(phrases: list[dict], beat: float) -> Optional[dict]:
     if not phrases:
         return None
     if beat <= phrases[0]["start_beat"]:
@@ -163,7 +180,7 @@ def section_for_beat(phrases: list[dict], beat: int) -> Optional[dict]:
 
 
 def on_client_change(player_number: int) -> None:
-    global _active_deck, _last_mode
+    global _active_deck, _last_mode, _pause_since
     if prodj is None:
         return
     client = prodj.cl.getClient(player_number)
@@ -188,18 +205,31 @@ def on_client_change(player_number: int) -> None:
     if is_playing:
         if _active_deck is None:
             _active_deck = player_number
+            if track_id and track_id > 0:
+                _committed_track_by_deck[player_number] = track_id
             _last_mode = None
             print(f"[deck] active -> {player_number}", flush=True)
         elif _active_deck != player_number:
-            current_cl = prodj.cl.getClient(_active_deck)
-            current_playing = bool(current_cl) and getattr(
-                current_cl, "play_state", "stopped"
-            ) in {"playing", "cue_play", "looping"}
-            if not current_playing:
-                _active_deck = player_number
-                _last_mode = None
-                print(f"[deck] active -> {player_number} "
-                      f"(previous deck stopped)", flush=True)
+            # Flap-back guard: once we've already flipped to this (deck,
+            # track_id) during this track's life, don't flip back to it on a
+            # momentary pause of the outgoing deck. Only a NEW track loaded on
+            # this deck (different track_id) clears the guard.
+            already_committed = (
+                track_id
+                and _committed_track_by_deck.get(player_number) == track_id
+            )
+            if not already_committed:
+                current_cl = prodj.cl.getClient(_active_deck)
+                current_playing = bool(current_cl) and getattr(
+                    current_cl, "play_state", "stopped"
+                ) in {"playing", "cue_play", "looping"}
+                if not current_playing:
+                    _active_deck = player_number
+                    if track_id and track_id > 0:
+                        _committed_track_by_deck[player_number] = track_id
+                    _last_mode = None
+                    print(f"[deck] active -> {player_number} "
+                          f"(previous deck stopped)", flush=True)
 
     # Pre-load analysis for ANY deck that loads a track, not just the active
     # one — so when a crossfade promotes the other deck, we already have its
@@ -227,6 +257,13 @@ def on_client_change(player_number: int) -> None:
 
             threading.Thread(target=_load, daemon=True).start()
 
+    # Pause-blackout tracker — the watchdog thread fires the actual blackout.
+    if _active_deck == player_number:
+        if is_playing:
+            _pause_since = None
+        elif _pause_since is None:
+            _pause_since = time.monotonic()
+
     if _active_deck != player_number:
         return
     if not is_playing:
@@ -237,14 +274,23 @@ def on_client_change(player_number: int) -> None:
     analysis = _analysis_by_track.get(_active_track_by_deck.get(player_number, -1))
     if not analysis:
         return
-    section = section_for_beat(analysis["phrases"], beat_count)
+    # Fire the next section ~SCENE_LOOKAHEAD_MS early so lights lead the beat.
+    # beat_count is an integer that only ticks on whole beats, but we translate
+    # the lookahead into beats via live BPM and add it before the section
+    # lookup — so the last quarter-second of a phrase resolves to the NEXT
+    # phrase's mode.
+    bpm = getattr(client, "bpm", None) or analysis["track"].get("bpm") or 120
+    beats_ahead = SCENE_LOOKAHEAD_MS / 1000.0 * float(bpm) / 60.0
+    section = section_for_beat(analysis["phrases"], beat_count + beats_ahead)
     if not section:
         return
     mode = section["mode"]
     if mode != _last_mode:
         _last_mode = mode
-        print(f"[mode] beat={beat_count} -> {mode}", flush=True)
-        direct_lights.apply_mode(mode)
+        scene = direct_lights.apply_mode(mode)
+        scene_name = (scene or {}).get("name") or (scene or {}).get("id") or "—"
+        print(f"[mode] beat={beat_count} -> {mode} | scene: {scene_name}",
+              flush=True)
 
 
 def configure_vcdj_interface() -> bool:
@@ -285,6 +331,41 @@ def handle_signal(signum, frame):
     _shutdown.set()
 
 
+def _pause_watchdog() -> None:
+    """Blackout if the active deck stays paused past PAUSE_BLACKOUT_S.
+
+    Skips if a preview is running — the editor drives lights directly and we
+    shouldn't stomp on it. Resets _last_mode so the next live beat picks a
+    fresh scene instead of being suppressed by the mode-change guard.
+    """
+    global _pause_since, _last_mode
+    while not _shutdown.wait(0.5):
+        since = _pause_since
+        if since is None:
+            continue
+        if time.monotonic() - since < PAUSE_BLACKOUT_S:
+            continue
+        if prodj is None or _active_deck is None:
+            continue
+        cl = prodj.cl.getClient(_active_deck)
+        if cl is not None and getattr(cl, "play_state", "stopped") in {
+            "playing", "cue_play", "looping"
+        }:
+            _pause_since = None
+            continue
+        if direct_lights.status().get("preview"):
+            _pause_since = None
+            continue
+        print(f"[pause] active deck {_active_deck} idle "
+              f"{PAUSE_BLACKOUT_S:.0f}s — blackout", flush=True)
+        try:
+            direct_lights.blackout()
+        except Exception:
+            pass
+        _last_mode = None
+        _pause_since = None
+
+
 def main() -> None:
     global prodj
     print("[main] starting dj-lights mvp2", flush=True)
@@ -305,6 +386,8 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    threading.Thread(target=_pause_watchdog, name="pause-watchdog", daemon=True).start()
 
     try:
         while not _shutdown.is_set():
