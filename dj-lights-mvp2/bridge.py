@@ -30,13 +30,10 @@ def load_analysis(track_id: str | int) -> Dict[str, Any] | None:
 
 
 def ingest_track_payload(track: Dict[str, Any], pssi: Dict[str, Any], waveform: List[int]) -> Dict[str, Any]:
-    existing = load_analysis(track.get("track_id"))
-    existing_waveform = (existing or {}).get("waveform") or []
-    incoming_waveform = waveform or []
-
-    if existing and (existing_waveform or not incoming_waveform):
-        return existing
-
-    analysis = build_track_analysis(track, pssi, incoming_waveform)
+    # Fresh PSSI always wins. The previous cache-first branch returned stale
+    # analysis whenever `waveform=[]` (always true in this codebase), which
+    # meant any fallback-derived cache entry permanently poisoned the track
+    # even after the PSSI fetch path was fixed. Rebuild and overwrite.
+    analysis = build_track_analysis(track, pssi, waveform or [])
     save_analysis(analysis)
     return analysis
