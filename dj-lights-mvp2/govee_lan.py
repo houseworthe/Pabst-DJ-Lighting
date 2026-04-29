@@ -43,6 +43,9 @@ LAN_PORT_SEND = 4003
 
 CLOUD_BASE = "https://openapi.api.govee.com/router/api/v1"
 CLOUD_TIMEOUT = 4.0
+# Retries for transient cloud failures (429 rate-limit, 5xx, timeouts).
+# Delays between attempts — 3 total attempts (initial + len(retries)).
+CLOUD_RETRY_DELAYS_S = (0.2, 0.5)
 
 # Govee devices go white or drop commands when packets overlap. Hold this gap
 # between successive commands per device (LAN or cloud).
@@ -184,27 +187,37 @@ def _lan_send(ip: str, cmd: str, data: dict) -> None:
 
 
 def _cloud_control(api_key: str, sku: str, device: str, capability: dict) -> bool:
-    body = {
+    body = json.dumps({
         "requestId": str(uuid.uuid4()),
         "payload": {"sku": sku, "device": device, "capability": capability},
-    }
-    req = Request(
-        CLOUD_BASE + "/device/control",
-        data=json.dumps(body).encode(),
-        headers={"Govee-API-Key": api_key, "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(req, timeout=CLOUD_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode())
-        if data.get("code") != 200:
-            # Govee's control endpoint uses "msg", device list endpoint uses "message" — try both.
-            print(f"[govee] cloud {device[-8:]} -> {data.get('code')} {data.get('msg') or data.get('message')}", flush=True)
-            return False
-        return True
-    except Exception as e:
-        print(f"[govee] cloud {device[-8:]} error: {e}", flush=True)
-        return False
+    }).encode()
+    headers = {"Govee-API-Key": api_key, "Content-Type": "application/json"}
+    last_err: str | None = None
+    attempts = len(CLOUD_RETRY_DELAYS_S) + 1
+    for attempt in range(attempts):
+        req = Request(CLOUD_BASE + "/device/control", data=body, headers=headers, method="POST")
+        try:
+            with urlopen(req, timeout=CLOUD_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode())
+            code = data.get("code")
+            if code == 200:
+                if attempt > 0:
+                    print(f"[govee] cloud {device[-8:]} ok on retry #{attempt}", flush=True)
+                return True
+            msg = data.get("msg") or data.get("message")
+            # 429 rate-limit / 5xx are transient; anything else (400 bad request,
+            # 401 auth, etc.) won't get better by retrying.
+            transient = code == 429 or (isinstance(code, int) and 500 <= code < 600)
+            if not transient:
+                print(f"[govee] cloud {device[-8:]} -> {code} {msg}", flush=True)
+                return False
+            last_err = f"{code} {msg}"
+        except Exception as e:
+            last_err = str(e)
+        if attempt < attempts - 1:
+            time.sleep(CLOUD_RETRY_DELAYS_S[attempt])
+    print(f"[govee] cloud {device[-8:]} failed after {attempts} attempts: {last_err}", flush=True)
+    return False
 
 
 def cloud_fetch_scenes(api_key: str, sku: str, device: str, instance: str = "lightScene") -> list[dict]:

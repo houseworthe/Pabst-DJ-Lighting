@@ -131,11 +131,20 @@ class ScenesStore:
                 return s
         return None
 
-    def pick_scene(self, category: str) -> Optional[dict]:
-        """Return a random scene from the category, or None if empty."""
+    def pick_scene(self, category: str, exclude_id: Optional[str] = None) -> Optional[dict]:
+        """Return a random scene from the category, or None if empty.
+
+        `exclude_id` filters out one scene (e.g. the currently-running one for
+        a force-refresh). Falls through to the full pool if exclusion would
+        leave nothing to pick.
+        """
         pool = [s for s in self.scenes if s.get("category") == category]
         if not pool:
             return None
+        if exclude_id is not None:
+            filtered = [s for s in pool if s.get("id") != exclude_id]
+            if filtered:
+                pool = filtered
         return random.choice(pool)
 
     def snapshot(self) -> dict:

@@ -24,11 +24,24 @@ FTDI_VID = 0x0403
 FTDI_PID = 0x6001
 
 # DMX Addressing — update these if fixture addresses change
-# Both Tetra 12s on d.001 (channels 1-6)
-# Bar on d.008 (channels 8-31, 24-ch mode, 4 zones × 6ch)
-TETRA12_ADDRS = [1]  # both fixtures respond to addr 1
-TETRA_BAR_ADDR = 8
+# Wash 1 on d.001 (channels 1-6, 6-ch mode), Wash 2 on d.007 (channels 7-12)
+# Bar on d.013 (channels 13-36, 24-ch mode, 4 zones × 6ch)
+# Index 0 = left wash, index 1 = right wash (used by set_12s_one).
+TETRA12_ADDRS = [1, 7]
+TETRA_BAR_ADDR = 13
 TETRA_BAR_ZONES = 4
+
+# --- Fixture capability reference (Venue manuals, see repo root PDFs) ---
+# Tetra 12 (wash par): 12× 4W RGBA LEDs, single rendering surface — no zones,
+#   no per-LED control. DMX modes available: 3/4/5/6-CH. The 6-CH mode we use
+#   is R/G/B/A/Dimmer/Strobe; max channel count is 6. There is no way to drive
+#   individual LEDs on this fixture.
+# Tetra Bar: 12× 4W RGBA LEDs in 4 fixed zones (3 LEDs per zone, ganged in
+#   hardware). DMX modes: 3/4/5/6 (single-zone), 12/16/20/24/28 (quad-zone).
+#   24-CH = R/G/B/A/Dim/Strobe per zone (current). The bar's 28-CH "Tetra
+#   Control Mode" exists for the proprietary Venue Tetra Control desk and
+#   exposes the same 4 zones. There is NO per-pixel mode — 4 zones is the
+#   hardware ceiling. Per-LED control is physically impossible on this bar.
 
 # Channel offsets (6-ch mode)
 CH_R, CH_G, CH_B, CH_A, CH_DIM, CH_STROBE = 0, 1, 2, 3, 4, 5
@@ -112,6 +125,10 @@ class DMX:
     def set_12s(self, r, g, b, a=0, dimmer=255, strobe=0):
         for addr in TETRA12_ADDRS:
             self.set_fixture(addr, r, g, b, a, dimmer, strobe)
+
+    def set_12s_one(self, idx, r, g, b, a=0, dimmer=255, strobe=0):
+        if 0 <= idx < len(TETRA12_ADDRS):
+            self.set_fixture(TETRA12_ADDRS[idx], r, g, b, a, dimmer, strobe)
 
     def set_bar(self, r, g, b, a=0, dimmer=255, strobe=0):
         for zone in range(TETRA_BAR_ZONES):

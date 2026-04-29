@@ -14,7 +14,10 @@ Layer schema reference:
     solid         {type, target, rgb[r,g,b], amber, dim, strobe}
     breathe       {type, target, rgb, amber, hz, dim_min, dim_max, strobe}
     chase         {type, rgb, amber, rate_hz, dim_active, dim_rest, strobe}
-                  (target is implicitly the 4 bar zones)
+                  (target is implicitly wash↔bar; not a per-zone chase)
+    bar_chase     {type, colors, rate_hz, direction, tail, dim_active,
+                   dim_rest, amber, strobe, wash}
+                  (per-zone sweep across the 4 bar zones)
     pulse         {type, target, colors[[r,g,b],...], amber, on_ms, off_ms,
                    dim, strobe}
     strobe        {type, target, rgb, amber, dim, rate}
@@ -40,8 +43,8 @@ from typing import Any, Callable, Optional
 
 TICK_S = 0.03  # 30ms render tick; pulse timing uses monotonic clock, so jitter is invisible.
 
-DMX_TARGETS = {"all", "wash", "bar_all", "bar_z1", "bar_z2", "bar_z3", "bar_z4"}
-LAYER_TYPES = {"solid", "breathe", "chase", "pulse", "strobe", "random_flash", "govee_rgb", "govee_preset"}
+DMX_TARGETS = {"all", "wash", "wash_1", "wash_2", "bar_all", "bar_z1", "bar_z2", "bar_z3", "bar_z4"}
+LAYER_TYPES = {"solid", "breathe", "chase", "bar_chase", "pulse", "strobe", "random_flash", "govee_rgb", "govee_preset"}
 
 
 def _clamp(v: float, lo: float = 0, hi: float = 255) -> int:
@@ -66,6 +69,10 @@ def _paint_target(dmx, target: str, r: int, g: int, b: int, a: int, dim: int, st
         dmx.set_all(rr, gg, bb, aa, 255, strobe)
     elif target == "wash":
         dmx.set_12s(rr, gg, bb, aa, 255, strobe)
+    elif target == "wash_1":
+        dmx.set_12s_one(0, rr, gg, bb, aa, 255, strobe)
+    elif target == "wash_2":
+        dmx.set_12s_one(1, rr, gg, bb, aa, 255, strobe)
     elif target == "bar_all":
         for z in range(1, 5):
             dmx.set_bar_zone(z, rr, gg, bb, aa, 255, strobe)
@@ -123,6 +130,10 @@ def _layer_breathe(dmx, layer: dict, t: float, state: dict) -> None:
             dmx.set_bar_zone(z, br, bg, bb_, ba, 255, 0)
     elif target == "wash":
         dmx.set_12s(wr, wg, wb, wa, 255, 0)
+    elif target == "wash_1":
+        dmx.set_12s_one(0, wr, wg, wb, wa, 255, 0)
+    elif target == "wash_2":
+        dmx.set_12s_one(1, wr, wg, wb, wa, 255, 0)
     elif target == "bar_all":
         for z in range(1, 5):
             dmx.set_bar_zone(z, br, bg, bb_, ba, 255, 0)
@@ -164,6 +175,91 @@ def _layer_chase(dmx, layer: dict, t: float, state: dict) -> None:
     dmx.set_12s(wr, wg, wb, wa, 255, 0)
     for z in range(1, 5):
         dmx.set_bar_zone(z, br, bg, bb_, ba, 255, 0)
+
+
+def _layer_bar_chase(dmx, layer: dict, t: float, state: dict) -> None:
+    """Per-zone chase across the 4 bar zones — the classic L→R sweep.
+
+    Direction:
+      "wrap"     — head loops 1→2→3→4→1; tail wraps around the ends.
+      "pingpong" — head bounces 1→2→3→4→3→2→1; tail follows the direction
+                   of motion, so it always trails behind the head.
+
+    `tail` (0..3) adds dimmer trailing zones between the head (`dim_active`)
+    and the inactive level (`dim_rest`). tail=0 = sharp single-zone hit.
+    Color advances one slot per zone-step, so a 4-color palette gives each
+    zone a different color as the head walks across.
+
+    `wash`:
+      "off"     — Tetra 12s stay dark (frame-clear blackout).
+      "match"   — wash mirrors the head color at dim_active. Reads as a pulse
+                  that walks alongside the chase. Useful as the only wash
+                  driver in a scene; pair with a separate solid/breathe layer
+                  if you want a steady wash baseline underneath.
+      "include" — wash 1 and wash 2 become positions 5 and 6 in the rotation.
+                  Head walks bar_z1 → z2 → z3 → z4 → wash_2 → wash_1 → repeat,
+                  reading as a clockwise sweep when wash_1 sits left of the bar
+                  and wash_2 sits right. (Pingpong bounces the same path.)
+    """
+    colors = layer.get("colors") or [[255, 255, 255]]
+    if not colors:
+        colors = [[255, 255, 255]]
+    rate_hz = float(layer.get("rate_hz", 4.0))
+    direction = layer.get("direction", "wrap")
+    tail = max(0, min(3, int(layer.get("tail", 0))))
+    dim_active = int(layer.get("dim_active", 255))
+    dim_rest = int(layer.get("dim_rest", 0))
+    amber = layer.get("amber", 0)
+    strobe = int(layer.get("strobe", 0))
+    wash_mode = layer.get("wash", "off")
+    include_wash = wash_mode == "include"
+
+    n = 6 if include_wash else 4
+    step = int(t * rate_hz)
+
+    def head_for(s: int) -> int:
+        if direction == "pingpong":
+            cycle = (n - 1) * 2  # 6 for 4 zones
+            sm = s % cycle
+            return sm if sm < n else cycle - sm
+        return s % n
+
+    head = head_for(step)
+    color_idx = step % len(colors)
+    r, g, b = colors[color_idx][:3]
+
+    if direction == "pingpong":
+        prev = head_for(step - 1) if step > 0 else head
+        sign = 1 if head >= prev else -1
+    else:
+        sign = 1  # wrap mode advances right; tail wraps via modulo below
+
+    span = max(1, dim_active - dim_rest)
+    for zi in range(n):
+        if direction == "wrap":
+            offset = (head - zi) % n  # always 0..n-1, tail wraps around
+        else:
+            offset = (head - zi) * sign  # negative = ahead of head, ignored
+
+        if offset == 0:
+            dim = dim_active
+        elif 1 <= offset <= tail:
+            strength = (tail + 1 - offset) / (tail + 1)
+            dim = dim_rest + int(span * strength)
+        else:
+            dim = dim_rest
+
+        rr, gg, bb_, aa = _scale(r, g, b, amber, dim)
+        if zi < 4:
+            dmx.set_bar_zone(zi + 1, rr, gg, bb_, aa, 255, _clamp(strobe))
+        elif zi == 4:
+            dmx.set_12s_one(1, rr, gg, bb_, aa, 255, _clamp(strobe))  # wash_2 (right)
+        else:
+            dmx.set_12s_one(0, rr, gg, bb_, aa, 255, _clamp(strobe))  # wash_1 (left)
+
+    if not include_wash and wash_mode == "match":
+        wr, wg, wb, wa = _scale(r, g, b, amber, dim_active)
+        dmx.set_12s(wr, wg, wb, wa, 255, _clamp(strobe))
 
 
 def _layer_pulse(dmx, layer: dict, t: float, state: dict) -> None:
@@ -257,6 +353,7 @@ DMX_LAYER_RENDERERS: dict[str, Callable[[Any, dict, float, dict], None]] = {
     "solid": _layer_solid,
     "breathe": _layer_breathe,
     "chase": _layer_chase,
+    "bar_chase": _layer_bar_chase,
     "pulse": _layer_pulse,
     "strobe": _layer_strobe,
     "random_flash": _layer_random_flash,
@@ -295,7 +392,32 @@ class SceneEngine:
 
     def _fire_govee_layers(self) -> None:
         """Trigger Govee layers once at scene start. Presets play autonomously
-        on-device; LAN RGB is held until we fire a new one."""
+        on-device; LAN RGB is held until we fire a new one.
+
+        Any Govee SKU in the fleet that this scene does NOT reference is
+        turned off first — otherwise the old scene's preset keeps running
+        on devices the new scene ignores (e.g. a drop scene that only drives
+        COB strips would leave the bulbs stuck on the previous color).
+        """
+        referenced_skus: set[str] = set()
+        for layer in self.scene.get("layers", []):
+            ltype = layer.get("type")
+            if ltype == "govee_preset":
+                presets = layer.get("presets")
+                if isinstance(presets, dict):
+                    referenced_skus.update(k for k, v in presets.items() if v is not None)
+                else:
+                    referenced_skus.update(layer.get("skus") or [])
+            elif ltype == "govee_rgb":
+                referenced_skus.update(layer.get("skus") or [])
+        fleet_skus = {d.get("sku") for d in self.govee.devices if d.get("sku")}
+        to_off = fleet_skus - referenced_skus
+        if to_off:
+            try:
+                self.govee.turn_skus(list(to_off), False)
+            except Exception as e:
+                print(f"[scene_engine] govee turn off {sorted(to_off)} failed: {e}", flush=True)
+
         for layer in self.scene.get("layers", []):
             ltype = layer.get("type")
             try:
@@ -304,10 +426,9 @@ class SceneEngine:
                     # Legacy format (still honored): {skus: [sku], param_id}.
                     presets = layer.get("presets")
                     if isinstance(presets, dict) and presets:
-                        for sku, param_id in presets.items():
-                            if param_id is None:
-                                continue
-                            self.govee.set_scene_for_sku(sku, int(param_id))
+                        valid = {sku: int(pid) for sku, pid in presets.items() if pid is not None}
+                        if valid:
+                            self.govee.apply_mode_scenes(valid)
                     else:
                         skus = layer.get("skus") or []
                         param_id = layer.get("param_id")
@@ -357,10 +478,9 @@ class SceneEngine:
         # Per-layer mutable state — lets renderers like random_flash remember
         # schedules across ticks. Lives for the engine's lifetime only.
         states: list[dict] = [{} for _ in layers]
-        if not layers:
-            while not self._stop.wait(TICK_S):
-                pass
-            return
+        # Always run the tick loop even with zero DMX layers, so the previous
+        # scene's final frame gets overwritten by blackout instead of holding.
+        # Scene contract: absent DMX layer = fixtures off.
         while not self._stop.is_set():
             t = time.monotonic() - start
             try:

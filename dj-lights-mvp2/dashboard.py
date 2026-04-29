@@ -57,9 +57,13 @@ def _lazy_store():
 _state_lock = threading.Lock()
 _state: dict[str, Any] = {
     "deck": None,
-    "track": None,
+    # Per-deck track analysis. Keyed by deck number; the dashboard surfaces the
+    # ACTIVE deck's entry so the phrase timeline can't drift onto a track that
+    # isn't currently driving the lights.
+    "tracks_by_deck": {},
     "beat": None,
     "mode": None,
+    "scene": None,
     "last_beat_ts": None,
     "status_packets": 0,
     "vcdj_ticks": 0,
@@ -79,7 +83,7 @@ RE_TRACK = re.compile(
     r'^\[track\] deck=(\d+) id=(\d+) "([^"]*)" \S+ (\d+) phrases'
 )
 RE_PHRASES = re.compile(r"^\[phrases\] deck=(\d+) id=(\d+) (.+)$")
-RE_MODE = re.compile(r"^\[mode\] beat=(\d+) -> (\w+)")
+RE_MODE = re.compile(r"^\[mode\] beat=(\d+) -> (\w+)(?: \| scene: (.+))?$")
 RE_STATUS = re.compile(r"STATUS PACKET deck (\d+): beat_count \S+ -> (\d+)")
 RE_TICK = re.compile(r"vcdj status tick #(\d+)")
 RE_GOVEE = re.compile(r"^\[govee\] cloud (\S+) -> (\d+) (.*)$")
@@ -87,8 +91,9 @@ RE_DMX = re.compile(r"^\[dmx\] opened")
 
 
 def _reset_on_main_restart() -> None:
-    _state["track"] = None
+    _state["tracks_by_deck"] = {}
     _state["mode"] = None
+    _state["scene"] = None
     _state["beat"] = None
     _state["status_packets"] = 0
     _state["vcdj_ticks"] = 0
@@ -118,24 +123,33 @@ def apply_line(line: str) -> None:
             return
         if m := RE_TRACK.match(body):
             deck, tid, title, n = m.groups()
-            _state["track"] = {
-                "deck": int(deck), "id": tid, "title": title,
+            deck_i = int(deck)
+            _state["tracks_by_deck"][deck_i] = {
+                "deck": deck_i, "id": tid, "title": title,
                 "phrase_count": int(n), "phrases": [],
             }
-            _state["mode"] = None
+            # Only clear mode/scene if THIS deck is active — a track load on
+            # the other deck shouldn't blank the badge for the deck currently
+            # driving lights.
+            if _state["deck"] == deck_i:
+                _state["mode"] = None
+                _state["scene"] = None
             return
         if m := RE_PHRASES.match(body):
-            _deck, tid, payload = m.groups()
+            deck, tid, payload = m.groups()
+            deck_i = int(deck)
             try:
                 phrases = json.loads(payload)
             except json.JSONDecodeError:
                 return
-            if _state["track"] and _state["track"]["id"] == tid:
-                _state["track"]["phrases"] = phrases
+            entry = _state["tracks_by_deck"].get(deck_i)
+            if entry and entry["id"] == tid:
+                entry["phrases"] = phrases
             return
         if m := RE_MODE.match(body):
             _state["beat"] = int(m.group(1))
             _state["mode"] = m.group(2)
+            _state["scene"] = m.group(3)  # None on legacy lines
             return
         if m := RE_STATUS.search(body):
             _state["status_packets"] += 1
@@ -189,6 +203,8 @@ FIXTURES = {
     "dmx_targets": [
         {"id": "all", "name": "All fixtures (wash + bar)"},
         {"id": "wash", "name": "Tetra 12 wash pars (x2, both sides)"},
+        {"id": "wash_1", "name": "Tetra 12 wash — left (d.001)"},
+        {"id": "wash_2", "name": "Tetra 12 wash — right (d.007)"},
         {"id": "bar_all", "name": "Tetra Bar — all 4 bulbs"},
         {"id": "bar_z1", "name": "Tetra Bar — bulb 1 (far left)"},
         {"id": "bar_z2", "name": "Tetra Bar — bulb 2 (center-left)"},
@@ -262,6 +278,38 @@ FIXTURES = {
                  "label": "on brightness", "unit": "/ 255"},
                 {"key": "dim_rest", "kind": "int", "min": 0, "max": 255, "default": 0,
                  "label": "off brightness", "unit": "/ 255"},
+            ],
+        },
+        {
+            "type": "bar_chase",
+            "label": "Bar chase (per-zone sweep)",
+            "description": "A single bright zone walks across bulbs 1→4. With multiple colors, each zone-step picks the next color. Add a tail for a comet trail.",
+            "params": [
+                {"key": "colors", "kind": "color_list", "label": "colors",
+                 "default": [[255, 80, 0]]},
+                {"key": "amber", "kind": "int", "min": 0, "max": 255, "default": 0,
+                 "label": "amber", "unit": "/ 255"},
+                {"key": "rate_hz", "kind": "float", "min": 0.5, "max": 20.0, "step": 0.1,
+                 "default": 4.0, "label": "speed", "unit": "zones/s"},
+                {"key": "direction", "kind": "select", "label": "direction",
+                 "default": "wrap",
+                 "options": [
+                     {"value": "wrap", "label": "wrap (1→2→3→4→1)"},
+                     {"value": "pingpong", "label": "pingpong (1→2→3→4→3→2→1)"},
+                 ]},
+                {"key": "tail", "kind": "int", "min": 0, "max": 3, "default": 0,
+                 "label": "tail length", "unit": "zones"},
+                {"key": "dim_active", "kind": "int", "min": 0, "max": 255, "default": 200,
+                 "label": "head brightness", "unit": "/ 255"},
+                {"key": "dim_rest", "kind": "int", "min": 0, "max": 255, "default": 0,
+                 "label": "rest brightness", "unit": "/ 255"},
+                {"key": "wash", "kind": "select", "label": "wash",
+                 "default": "off",
+                 "options": [
+                     {"value": "off", "label": "off (Tetra 12s dark)"},
+                     {"value": "match", "label": "match head color"},
+                     {"value": "include", "label": "include in chase (5th position)"},
+                 ]},
             ],
         },
         {
@@ -368,6 +416,9 @@ INDEX_HTML = """<!doctype html>
   .mode-badge { padding: 28px 20px; border-radius: 8px; text-align: center;
                 font-size: 48px; font-weight: 700; letter-spacing: 2px;
                 text-transform: uppercase; transition: background 0.3s; }
+  .mode-badge .scene { display: block; font-size: 18px; letter-spacing: 1px;
+                       text-transform: none; font-weight: 500; opacity: 0.85;
+                       margin-top: 6px; }
   .mode-intro     { background: #1a2b4a; }
   .mode-groove    { background: #1a4a2b; }
   .mode-buildup   { background: #8a5500; }
@@ -400,6 +451,17 @@ INDEX_HTML = """<!doctype html>
               max-height: 140px; overflow-y: auto;
               font-variant-numeric: tabular-nums; }
   ul.errors li { padding: 3px 0; border-bottom: 1px solid #222; }
+  .controls { display: flex; gap: 12px; }
+  .controls button { flex: 1; padding: 14px 18px; font-size: 14px;
+                     font-weight: 600; letter-spacing: 1px; text-transform: uppercase;
+                     background: #1c1c1c; color: #e0e0e0; border: 1px solid #333;
+                     border-radius: 6px; cursor: pointer; transition: background 0.15s; }
+  .controls button:hover:not(:disabled) { background: #252525; border-color: #444; }
+  .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .controls button.danger  { background: #4a1a1a; border-color: #7a2a2a; color: #f4d4d4; }
+  .controls button.danger:hover:not(:disabled)  { background: #691a1a; }
+  .controls button.primary { background: #1c5220; border-color: #2a7a30; color: #d4f4d8; }
+  .controls button.primary:hover:not(:disabled) { background: #22692a; }
 </style></head>
 <body>
 <div class="nav">
@@ -410,6 +472,12 @@ INDEX_HTML = """<!doctype html>
   <div class="card full">
     <h2>current mode</h2>
     <div id="mode" class="mode-badge mode-unknown">idle</div>
+  </div>
+  <div class="card full"><h2>controls</h2>
+    <div class="controls">
+      <button id="btn-blackout" class="danger" type="button">Blackout</button>
+      <button id="btn-refresh" class="primary" type="button">Refresh scene</button>
+    </div>
   </div>
   <div class="card"><h2>track</h2><div class="kv" id="track-info"></div></div>
   <div class="card"><h2>position</h2><div class="kv" id="live-info"></div></div>
@@ -440,11 +508,34 @@ async function poll() {
   catch(_e){}
   setTimeout(poll, 400);
 }
+async function postJson(url) {
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  return r.json().catch(() => ({}));
+}
+function wireControls() {
+  const blackoutBtn = document.getElementById('btn-blackout');
+  const refreshBtn = document.getElementById('btn-refresh');
+  blackoutBtn.onclick = async () => {
+    blackoutBtn.disabled = true;
+    try { await postJson('/api/blackout'); }
+    finally { blackoutBtn.disabled = false; }
+  };
+  refreshBtn.onclick = async () => {
+    refreshBtn.disabled = true;
+    try { await postJson('/api/scene/refresh'); }
+    finally { refreshBtn.disabled = false; }
+  };
+}
+wireControls();
 function render(s) {
   const modeEl = document.getElementById('mode');
   const mode = s.mode && KNOWN_MODES.has(s.mode) ? s.mode : (s.mode ? 'unknown' : 'unknown');
   modeEl.className = 'mode-badge mode-' + mode;
-  modeEl.textContent = s.mode || 'idle';
+  clear(modeEl);
+  modeEl.appendChild(document.createTextNode(s.mode || 'idle'));
+  if (s.scene) {
+    const sc = el('span', 'scene'); sc.textContent = s.scene; modeEl.appendChild(sc);
+  }
   const t = document.getElementById('track-info'); clear(t);
   if (s.track) {
     addKV(t, 'deck', s.track.deck); addKV(t, 'id', s.track.id);
@@ -761,6 +852,12 @@ function renderEditor() {
   }
   scene.layers = scene.layers || [];
   ed.appendChild(renderSceneHead(scene));
+  if (scene.blackout) {
+    const note = el('div', 'empty');
+    note.textContent = 'Blackout scene — DMX zeroed, Govee off. Layers ignored.';
+    ed.appendChild(note);
+    return;
+  }
   FIXTURES.device_groups.forEach(g => ed.appendChild(renderGoveeGroup(scene, g)));
   ed.appendChild(renderDmxGroup(scene));
 }
@@ -779,6 +876,19 @@ function renderSceneHead(scene) {
   });
   catS.onchange = () => { scene.category = catS.value; setDirty(true); renderRail(); };
   head.appendChild(catS);
+  const boLabel = el('label');
+  boLabel.style.display = 'flex'; boLabel.style.alignItems = 'center'; boLabel.style.gap = '6px';
+  boLabel.style.fontSize = '12px'; boLabel.style.color = '#aaa';
+  const boCb = el('input'); boCb.type = 'checkbox'; boCb.checked = !!scene.blackout;
+  boCb.onchange = () => {
+    scene.blackout = boCb.checked;
+    setDirty(true);
+    if (previewing) maybePushPreview(scene);
+    renderEditor();
+  };
+  boLabel.appendChild(boCb);
+  boLabel.appendChild(document.createTextNode('Blackout scene'));
+  head.appendChild(boLabel);
   head.appendChild(el('div', 'spacer'));
   const playBtn = el('button', previewing ? 'playing' : 'primary');
   playBtn.textContent = previewing ? 'Stop Preview' : 'Play Preview';
@@ -1120,6 +1230,19 @@ function renderParam(grid, scene, effect, p) {
     };
     grid.appendChild(range); grid.appendChild(valSpan); return;
   }
+  if (p.kind === 'select') {
+    const k = el('div','k'); k.textContent = p.label || p.key; grid.appendChild(k);
+    const sel = el('select');
+    const cur = (effect[p.key] != null) ? effect[p.key] : (p.default != null ? p.default : (p.options[0] && p.options[0].value));
+    (p.options || []).forEach(opt => {
+      const o = el('option'); o.value = opt.value; o.textContent = opt.label;
+      if (opt.value === cur) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.onchange = () => { effect[p.key] = sel.value; setDirty(true); maybePushPreview(scene); };
+    const wrap = el('div'); wrap.style.gridColumn = '2 / span 2'; wrap.appendChild(sel);
+    grid.appendChild(wrap); return;
+  }
 }
 
 function defaultEffect(type) {
@@ -1130,8 +1253,9 @@ function defaultEffect(type) {
     if (p.optional) return;
     if (p.kind === 'target') base.target = 'all';
     else if (p.kind === 'color') base.rgb = Array.isArray(p.default) ? p.default.slice() : [255, 120, 20];
-    else if (p.kind === 'color_list') base.colors = [[255,0,0],[0,0,255]];
+    else if (p.kind === 'color_list') base.colors = Array.isArray(p.default) ? p.default.map(c => c.slice()) : [[255,0,0],[0,0,255]];
     else if (p.kind === 'int' || p.kind === 'float') base[p.key] = p.default != null ? p.default : 0;
+    else if (p.kind === 'select') base[p.key] = p.default != null ? p.default : (p.options && p.options[0] && p.options[0].value);
   });
   return base;
 }
@@ -1260,7 +1384,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/state":
             with _state_lock:
-                self._send_json(_state)
+                # Project the active deck's track entry into `track` so the
+                # client doesn't have to know about tracks_by_deck.
+                snap = dict(_state)
+                deck = snap.get("deck")
+                tbd = snap.get("tracks_by_deck") or {}
+                snap["track"] = tbd.get(deck) if deck is not None else None
+                self._send_json(snap)
             return
         if self.path == "/api/scenes":
             store = _lazy_store()
@@ -1343,6 +1473,28 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 dl.stop_preview(resume_mode=True)
                 self._send_json({"ok": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=400)
+            return
+        if self.path == "/api/blackout":
+            dl = _lazy_direct_lights()
+            if dl is None:
+                self._send_json({"error": "direct_lights not available (is main.py running?)"}, status=503)
+                return
+            try:
+                dl.blackout()
+                self._send_json({"ok": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=400)
+            return
+        if self.path == "/api/scene/refresh":
+            dl = _lazy_direct_lights()
+            if dl is None:
+                self._send_json({"error": "direct_lights not available"}, status=503)
+                return
+            try:
+                refreshed = dl.refresh_scene()
+                self._send_json({"ok": True, "refreshed": bool(refreshed)})
             except Exception as e:
                 self._send_json({"error": str(e)}, status=400)
             return

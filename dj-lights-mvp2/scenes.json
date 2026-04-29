@@ -181,10 +181,10 @@
             255
           ],
           "amber": 0,
-          "dim": 234,
-          "min_gap_s": 6,
-          "max_gap_s": 12,
-          "double_chance": 10,
+          "dim": 112,
+          "min_gap_s": 2,
+          "max_gap_s": 4,
+          "double_chance": 50,
           "flash_ms": 77
         }
       ]
@@ -214,16 +214,28 @@
           }
         },
         {
-          "type": "strobe",
-          "target": "all",
-          "rgb": [
-            255,
-            0,
-            0
+          "type": "chase",
+          "colors": [
+            [
+              255,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              255
+            ],
+            [
+              255,
+              255,
+              255
+            ]
           ],
           "amber": 0,
-          "dim": 10,
-          "rate": 153
+          "rate_hz": 5.8,
+          "dim_active": 65,
+          "dim_rest": 0
         }
       ]
     },
@@ -422,6 +434,40 @@
           "presets": {
             "H61E5": 18349
           }
+        }
+      ]
+    },
+    {
+      "id": "scene-u198b5b4",
+      "name": "All Off",
+      "category": "intro",
+      "layers": []
+    },
+    {
+      "id": "scene-76aittzs",
+      "name": "All Off ",
+      "category": "outro",
+      "layers": []
+    },
+    {
+      "id": "drop-circle-strobe",
+      "name": "Circle Strobe",
+      "category": "drop",
+      "layers": [
+        {
+          "type": "bar_chase",
+          "colors": [
+            [255, 0, 0],
+            [255, 0, 200],
+            [0, 100, 255],
+            [255, 200, 0]
+          ],
+          "rate_hz": 6.0,
+          "direction": "wrap",
+          "tail": 0,
+          "dim_active": 180,
+          "dim_rest": 0,
+          "wash": "include"
         }
       ]
     }

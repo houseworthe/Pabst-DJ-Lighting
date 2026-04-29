@@ -51,6 +51,7 @@ class _NullDMX:
     def send_frame(self, *a, **k): pass
     def blackout(self, *a, **k): pass
     def set_12s(self, *a, **k): pass
+    def set_12s_one(self, *a, **k): pass
     def set_bar_zone(self, *a, **k): pass
     def set_fixture(self, *a, **k): pass
 
@@ -107,24 +108,45 @@ def _stop_engine_locked() -> None:
 
 
 def _run_scene(scene: dict, *, is_preview: bool, label: str) -> None:
-    """Stop whatever's running and start a new SceneEngine for `scene`."""
+    """Stop whatever's running and start a new SceneEngine for `scene`.
+
+    A scene with `"blackout": true` is treated as a state, not a frame: no
+    engine is started, DMX is zeroed and Govee turned off. `_current_mode`
+    and `_preview_active` are preserved so the next mode change resumes
+    normally — same contract as any other scene swap.
+    """
     global _current_engine, _current_scene_id, _preview_active
     dmx = _ensure_dmx()
+    is_blackout = bool(scene.get("blackout"))
     with _lock:
         _stop_engine_locked()
         _current_scene_id = scene.get("id")
         _preview_active = is_preview
-        engine = SceneEngine(scene, dmx, _govee)
-        engine.start()
-        _current_engine = engine
-    print(f"DIRECT_LIGHTS scene -> {label} ({scene.get('id')})", flush=True)
+        if not is_blackout:
+            engine = SceneEngine(scene, dmx, _govee)
+            engine.start()
+            _current_engine = engine
+    if is_blackout:
+        # Network/serial calls outside the lock — match blackout()'s pattern.
+        try:
+            dmx.blackout()
+            dmx.send_frame()
+        except Exception:
+            pass
+        try:
+            _govee.turn(False)
+        except Exception:
+            pass
+    suffix = " [blackout]" if is_blackout else ""
+    print(f"DIRECT_LIGHTS scene -> {label} ({scene.get('id')}){suffix}", flush=True)
 
 
-def apply_mode(mode: str) -> None:
+def apply_mode(mode: str) -> Optional[dict]:
     """Pick a random scene for this PSSI category and run it.
 
     Called by main.py on every mode change. If the category has no scenes,
-    blackout so lights don't freeze on the previous state.
+    blackout so lights don't freeze on the previous state. Returns the chosen
+    scene dict (or None) so the caller can log which scene actually fired.
     """
     global _current_mode, _preview_active
     store = get_store()
@@ -133,21 +155,42 @@ def apply_mode(mode: str) -> None:
     with _lock:
         if _preview_active:
             _current_mode = mode  # stash the mode; live resumes when preview stops
-            return
+            return None
         if mode == _current_mode and _current_engine is not None:
-            return
+            return None
         _current_mode = mode
     scene = store.pick_scene(mode)
     if scene is None:
         print(f"DIRECT_LIGHTS mode -> {mode} (no scenes in category)", flush=True)
         blackout()
-        return
+        return None
     _run_scene(scene, is_preview=False, label=f"mode:{mode}")
+    return scene
 
 
 def apply_scene_preview(scene: dict) -> None:
     """Run an arbitrary scene dict (editor 'Play' button)."""
     _run_scene(scene, is_preview=True, label="preview")
+
+
+def refresh_scene() -> bool:
+    """Force a re-pick from the current category, excluding the running scene.
+
+    Returns True if a new scene was started, False if no live mode is active
+    or a preview is in flight (dashboard greys the button in those cases, but
+    the check is here too so callers don't have to coordinate).
+    """
+    with _lock:
+        if _preview_active or _current_mode is None:
+            return False
+        mode = _current_mode
+        exclude = _current_scene_id
+    store = get_store()
+    scene = store.pick_scene(mode, exclude_id=exclude)
+    if scene is None:
+        return False
+    _run_scene(scene, is_preview=False, label=f"refresh:{mode}")
+    return True
 
 
 def stop_preview(resume_mode: bool = True) -> None:
