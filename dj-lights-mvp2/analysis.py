@@ -28,6 +28,14 @@ PSSI_LOW_MOOD = {
     7: "outro",
 }
 
+# Cap any drop phrase at 32 bars (128 beats). The remainder gets downgraded to
+# groove — PSSI never emits `groove` on high-mood tracks, so the groove scene
+# pool is otherwise dead inventory. Threshold for creating the tail: only split
+# if the remainder is at least 16 beats, matching normalize_phrases'
+# min_section_beats — otherwise we'd flicker to a 2-beat groove sliver.
+MAX_DROP_BEATS = 128
+MIN_SPLIT_TAIL_BEATS = 16
+
 
 def mode_map_for_mood(mood: str | int | None) -> Dict[int, str]:
     if str(mood) in {"high", "1"}:
@@ -86,7 +94,29 @@ def normalize_phrases(pssi: Dict[str, Any]) -> List[Dict[str, Any]]:
         for i in range(len(squashed) - 1):
             squashed[i]["end_beat"] = squashed[i + 1]["start_beat"]
 
-    return squashed
+    return _cap_long_drops(squashed)
+
+
+def _cap_long_drops(phrases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Split any drop phrase > MAX_DROP_BEATS into drop[:cap] + groove[cap:end]."""
+    out: List[Dict[str, Any]] = []
+    for p in phrases:
+        if p["mode"] != "drop":
+            out.append(p)
+            continue
+        length = p["end_beat"] - p["start_beat"]
+        if length - MAX_DROP_BEATS < MIN_SPLIT_TAIL_BEATS:
+            out.append(p)
+            continue
+        split = p["start_beat"] + MAX_DROP_BEATS
+        out.append({**p, "end_beat": split})
+        out.append({
+            "start_beat": split,
+            "end_beat": p["end_beat"],
+            "mode": "groove",
+            "raw_type": p.get("raw_type"),
+        })
+    return out
 
 
 def simplify_waveform(raw_waveform: List[int], target_points: int = 240) -> List[int]:
