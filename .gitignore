@@ -16,3 +16,6 @@ nohup.out
 
 # Pioneer rekordbox exports
 databases/
+
+# macOS
+.DS_Store
