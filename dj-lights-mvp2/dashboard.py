@@ -313,6 +313,61 @@ FIXTURES = {
             ],
         },
         {
+            "type": "wash_pingpong",
+            "label": "Wash ping-pong",
+            "description": "Hard ping-pong between left and right wash pars. Multiple colors cycle one per toggle.",
+            "params": [
+                {"key": "colors", "kind": "color_list", "label": "colors",
+                 "default": [[255, 0, 0], [0, 0, 255]]},
+                {"key": "amber", "kind": "int", "min": 0, "max": 255, "default": 0,
+                 "label": "amber", "unit": "/ 255"},
+                {"key": "rate_hz", "kind": "float", "min": 0.1, "max": 20.0, "step": 0.1,
+                 "default": 2.0, "label": "speed", "unit": "toggles/s"},
+                {"key": "dim_active", "kind": "int", "min": 0, "max": 255, "default": 200,
+                 "label": "on brightness", "unit": "/ 255"},
+                {"key": "dim_rest", "kind": "int", "min": 0, "max": 255, "default": 0,
+                 "label": "off brightness", "unit": "/ 255"},
+                {"key": "strobe", "kind": "int", "min": 0, "max": 255, "default": 0,
+                 "label": "strobe", "unit": "/ 255"},
+            ],
+        },
+        {
+            "type": "wash_chase",
+            "label": "Wash chase (crossfade)",
+            "description": "Smooth sinusoidal crossfade between left and right wash. Color advances per fade — pair colors swap sides each round trip.",
+            "params": [
+                {"key": "colors", "kind": "color_list", "label": "colors",
+                 "default": [[255, 80, 0], [0, 80, 255]]},
+                {"key": "amber", "kind": "int", "min": 0, "max": 255, "default": 0,
+                 "label": "amber", "unit": "/ 255"},
+                {"key": "hz", "kind": "float", "min": 0.05, "max": 5.0, "step": 0.05,
+                 "default": 0.5, "label": "speed", "unit": "Hz"},
+                {"key": "dim_min", "kind": "int", "min": 0, "max": 255, "default": 0,
+                 "label": "brightness min", "unit": "/ 255"},
+                {"key": "dim_max", "kind": "int", "min": 0, "max": 255, "default": 200,
+                 "label": "brightness max", "unit": "/ 255"},
+                {"key": "strobe", "kind": "int", "min": 0, "max": 255, "default": 0,
+                 "label": "strobe", "unit": "/ 255"},
+            ],
+        },
+        {
+            "type": "dual_wash",
+            "label": "Dual wash (asymmetric)",
+            "description": "Static split: left and right wash hold different colors. Use as a base under a busy chase, or standalone as a room-color split.",
+            "params": [
+                {"key": "rgb_left", "kind": "color", "label": "left color (wash 1)",
+                 "default": [255, 0, 180]},
+                {"key": "rgb_right", "kind": "color", "label": "right color (wash 2)",
+                 "default": [0, 180, 255]},
+                {"key": "amber", "kind": "int", "min": 0, "max": 255, "default": 0,
+                 "label": "amber", "unit": "/ 255"},
+                {"key": "dim", "kind": "int", "min": 0, "max": 255, "default": 200,
+                 "label": "brightness", "unit": "/ 255"},
+                {"key": "strobe", "kind": "int", "min": 0, "max": 255, "default": 0,
+                 "label": "strobe", "unit": "/ 255"},
+            ],
+        },
+        {
             "type": "pulse",
             "label": "Pulse (color cycle)",
             "description": "Flashes on/off, cycling through the colors list one per cycle.",
@@ -1191,9 +1246,10 @@ function renderParam(grid, scene, effect, p) {
   }
   if (p.kind === 'color') {
     const k = el('div','k'); k.textContent = p.label || 'color'; grid.appendChild(k);
+    const key = p.key || 'rgb';
     const ci = el('input'); ci.type = 'color';
-    ci.value = rgbToHex(effect.rgb || [0,0,0]);
-    ci.oninput = () => { effect.rgb = hexToRgb(ci.value); setDirty(true); maybePushPreview(scene); };
+    ci.value = rgbToHex(effect[key] || [0,0,0]);
+    ci.oninput = () => { effect[key] = hexToRgb(ci.value); setDirty(true); maybePushPreview(scene); };
     const wrap = el('div'); wrap.appendChild(ci);
     wrap.style.gridColumn = '2 / span 2'; grid.appendChild(wrap); return;
   }
@@ -1252,7 +1308,7 @@ function defaultEffect(type) {
   (schema.params || []).forEach(p => {
     if (p.optional) return;
     if (p.kind === 'target') base.target = 'all';
-    else if (p.kind === 'color') base.rgb = Array.isArray(p.default) ? p.default.slice() : [255, 120, 20];
+    else if (p.kind === 'color') base[p.key || 'rgb'] = Array.isArray(p.default) ? p.default.slice() : [255, 120, 20];
     else if (p.kind === 'color_list') base.colors = Array.isArray(p.default) ? p.default.map(c => c.slice()) : [[255,0,0],[0,0,255]];
     else if (p.kind === 'int' || p.kind === 'float') base[p.key] = p.default != null ? p.default : 0;
     else if (p.kind === 'select') base[p.key] = p.default != null ? p.default : (p.options && p.options[0] && p.options[0].value);

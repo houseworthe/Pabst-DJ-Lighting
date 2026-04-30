@@ -44,7 +44,7 @@ from typing import Any, Callable, Optional
 TICK_S = 0.03  # 30ms render tick; pulse timing uses monotonic clock, so jitter is invisible.
 
 DMX_TARGETS = {"all", "wash", "wash_1", "wash_2", "bar_all", "bar_z1", "bar_z2", "bar_z3", "bar_z4"}
-LAYER_TYPES = {"solid", "breathe", "chase", "bar_chase", "pulse", "strobe", "random_flash", "govee_rgb", "govee_preset"}
+LAYER_TYPES = {"solid", "breathe", "chase", "bar_chase", "wash_pingpong", "wash_chase", "dual_wash", "pulse", "strobe", "random_flash", "govee_rgb", "govee_preset"}
 
 
 def _clamp(v: float, lo: float = 0, hi: float = 255) -> int:
@@ -262,6 +262,72 @@ def _layer_bar_chase(dmx, layer: dict, t: float, state: dict) -> None:
         dmx.set_12s(wr, wg, wb, wa, 255, _clamp(strobe))
 
 
+def _layer_wash_pingpong(dmx, layer: dict, t: float, state: dict) -> None:
+    """Hard ping-pong between wash_1 and wash_2 at rate_hz toggles/sec.
+
+    Color advances one slot per toggle, so a 2-color palette gives each
+    side its own color. `dim_rest` keeps the "off" wash glowing — set to 0
+    for a single-wash-on-at-a-time strobe feel."""
+    colors = layer.get("colors") or [[255, 255, 255]]
+    rate_hz = float(layer.get("rate_hz", 2.0))
+    dim_on = int(layer.get("dim_active", 200))
+    dim_off = int(layer.get("dim_rest", 0))
+    amber = layer.get("amber", 0)
+    strobe = _clamp(int(layer.get("strobe", 0)))
+    step = int(t * rate_hz)
+    r, g, b = colors[step % len(colors)][:3]
+    on_r, on_g, on_b, on_a = _scale(r, g, b, amber, dim_on)
+    off_r, off_g, off_b, off_a = _scale(r, g, b, amber, dim_off)
+    if step % 2 == 0:
+        dmx.set_12s_one(0, on_r, on_g, on_b, on_a, 255, strobe)
+        dmx.set_12s_one(1, off_r, off_g, off_b, off_a, 255, strobe)
+    else:
+        dmx.set_12s_one(0, off_r, off_g, off_b, off_a, 255, strobe)
+        dmx.set_12s_one(1, on_r, on_g, on_b, on_a, 255, strobe)
+
+
+def _layer_wash_chase(dmx, layer: dict, t: float, state: dict) -> None:
+    """Smooth crossfade between wash_1 and wash_2 — sinusoidal blend.
+
+    As wash_1 brightens from dim_min toward dim_max, wash_2 darkens from
+    dim_max toward dim_min, and vice versa. One full back-and-forth per
+    1/hz seconds. Color advances one slot per half-cycle (per fade)."""
+    colors = layer.get("colors") or [[255, 255, 255]]
+    hz = float(layer.get("hz", 0.5))
+    dim_min = int(layer.get("dim_min", 0))
+    dim_max = int(layer.get("dim_max", 200))
+    amber = layer.get("amber", 0)
+    strobe = _clamp(int(layer.get("strobe", 0)))
+
+    wave = 0.5 + 0.5 * math.sin(2 * math.pi * hz * t)
+    dim_a = dim_min + (dim_max - dim_min) * wave
+    dim_b = dim_min + (dim_max - dim_min) * (1.0 - wave)
+
+    half_cycle_idx = int(t * 2 * hz) % len(colors)
+    r, g, b = colors[half_cycle_idx][:3]
+
+    ar, ag, ab, aa = _scale(r, g, b, amber, int(dim_a))
+    br, bg, bb_, ba = _scale(r, g, b, amber, int(dim_b))
+    dmx.set_12s_one(0, ar, ag, ab, aa, 255, strobe)
+    dmx.set_12s_one(1, br, bg, bb_, ba, 255, strobe)
+
+
+def _layer_dual_wash(dmx, layer: dict, t: float, state: dict) -> None:
+    """Static asymmetric wash: wash_1 holds rgb_left, wash_2 holds rgb_right.
+
+    Useful as a base layer under a busy bar chase, or as a standalone
+    breakdown look (teal/magenta room split etc.)."""
+    rgb_l = layer.get("rgb_left") or [255, 0, 255]
+    rgb_r = layer.get("rgb_right") or [0, 255, 255]
+    dim = _clamp(int(layer.get("dim", 200)))
+    amber = layer.get("amber", 0)
+    strobe = _clamp(int(layer.get("strobe", 0)))
+    lr, lg, lb, la = _scale(rgb_l[0], rgb_l[1], rgb_l[2], amber, dim)
+    rr, rg, rb, ra = _scale(rgb_r[0], rgb_r[1], rgb_r[2], amber, dim)
+    dmx.set_12s_one(0, lr, lg, lb, la, 255, strobe)
+    dmx.set_12s_one(1, rr, rg, rb, ra, 255, strobe)
+
+
 def _layer_pulse(dmx, layer: dict, t: float, state: dict) -> None:
     """Alternate target between a color (from colors[], advancing per cycle) and blackout."""
     target = layer.get("target", "all")
@@ -354,6 +420,9 @@ DMX_LAYER_RENDERERS: dict[str, Callable[[Any, dict, float, dict], None]] = {
     "breathe": _layer_breathe,
     "chase": _layer_chase,
     "bar_chase": _layer_bar_chase,
+    "wash_pingpong": _layer_wash_pingpong,
+    "wash_chase": _layer_wash_chase,
+    "dual_wash": _layer_dual_wash,
     "pulse": _layer_pulse,
     "strobe": _layer_strobe,
     "random_flash": _layer_random_flash,
