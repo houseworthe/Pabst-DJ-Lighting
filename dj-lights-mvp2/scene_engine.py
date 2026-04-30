@@ -34,6 +34,7 @@ if at least one layer renders cleanly.
 """
 from __future__ import annotations
 
+import json
 import math
 import random
 import threading
@@ -415,6 +416,16 @@ def _layer_random_flash(dmx, layer: dict, t: float, state: dict) -> None:
             return
 
 
+def _govee_signature(scene: dict) -> tuple:
+    """Stable key for the Govee subset of a scene. update_scene() compares
+    these to decide whether to re-fire Govee layers."""
+    return tuple(
+        json.dumps(l, sort_keys=True)
+        for l in scene.get("layers", [])
+        if l.get("type") in {"govee_preset", "govee_rgb"}
+    )
+
+
 DMX_LAYER_RENDERERS: dict[str, Callable[[Any, dict, float, dict], None]] = {
     "solid": _layer_solid,
     "breathe": _layer_breathe,
@@ -444,6 +455,14 @@ class SceneEngine:
         self.govee = govee
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Compiled DMX layers + per-layer state, swapped atomically by
+        # update_scene() so the editor can drag sliders without tearing down
+        # the render thread or re-firing Govee layers.
+        self._lock = threading.Lock()
+        self._dmx_layers: list = [
+            l for l in scene.get("layers", []) if l.get("type") in DMX_LAYER_RENDERERS
+        ]
+        self._states: list[dict] = [{} for _ in self._dmx_layers]
 
     def start(self) -> None:
         self._fire_govee_layers()
@@ -458,6 +477,37 @@ class SceneEngine:
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
+
+    def update_scene(self, new_scene: dict) -> None:
+        """Hot-swap layers without restarting the render thread.
+
+        Called when the editor pushes a slider/color change for the same scene
+        id — avoids the ~1s engine teardown and, more importantly, skips the
+        Govee network fan-out when only DMX layers changed.
+
+        Per-layer render state (random_flash schedules etc.) is preserved when
+        the layer at the same index keeps its type. Govee layers are only
+        re-fired when their JSON signature changes.
+        """
+        with self._lock:
+            old_layers = self._dmx_layers
+            old_states = self._states
+            old_sig = _govee_signature(self.scene)
+            new_dmx = [
+                l for l in new_scene.get("layers", []) if l.get("type") in DMX_LAYER_RENDERERS
+            ]
+            new_states: list[dict] = []
+            for i, l in enumerate(new_dmx):
+                if i < len(old_layers) and old_layers[i].get("type") == l.get("type"):
+                    new_states.append(old_states[i])
+                else:
+                    new_states.append({})
+            self.scene = new_scene
+            self._dmx_layers = new_dmx
+            self._states = new_states
+            new_sig = _govee_signature(new_scene)
+        if old_sig != new_sig:
+            self._fire_govee_layers()
 
     def _fire_govee_layers(self) -> None:
         """Trigger Govee layers once at scene start. Presets play autonomously
@@ -543,15 +593,17 @@ class SceneEngine:
 
     def _run(self) -> None:
         start = time.monotonic()
-        layers = [l for l in self.scene.get("layers", []) if l.get("type") in DMX_LAYER_RENDERERS]
-        # Per-layer mutable state — lets renderers like random_flash remember
-        # schedules across ticks. Lives for the engine's lifetime only.
-        states: list[dict] = [{} for _ in layers]
+        # Layers and per-layer state live on self and can be swapped under
+        # _lock by update_scene(). We snapshot the references each tick so
+        # renderers don't see a half-applied swap.
         # Always run the tick loop even with zero DMX layers, so the previous
         # scene's final frame gets overwritten by blackout instead of holding.
         # Scene contract: absent DMX layer = fixtures off.
         while not self._stop.is_set():
             t = time.monotonic() - start
+            with self._lock:
+                layers = self._dmx_layers
+                states = self._states
             try:
                 self.dmx.blackout()
                 for layer, state in zip(layers, states):

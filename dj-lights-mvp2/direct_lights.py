@@ -119,13 +119,31 @@ def _run_scene(scene: dict, *, is_preview: bool, label: str) -> None:
     dmx = _ensure_dmx()
     is_blackout = bool(scene.get("blackout"))
     with _lock:
-        _stop_engine_locked()
-        _current_scene_id = scene.get("id")
-        _preview_active = is_preview
-        if not is_blackout:
-            engine = SceneEngine(scene, dmx, _govee)
-            engine.start()
-            _current_engine = engine
+        # Hot-swap path: same scene id, same preview/live mode, engine still
+        # running. Lets the editor drag sliders without tearing down the
+        # render thread or re-firing Govee layers when only DMX changed.
+        hot_swap_engine = None
+        if (
+            not is_blackout
+            and _current_engine is not None
+            and _current_scene_id == scene.get("id")
+            and _preview_active == is_preview
+        ):
+            hot_swap_engine = _current_engine
+        if hot_swap_engine is None:
+            _stop_engine_locked()
+            _current_scene_id = scene.get("id")
+            _preview_active = is_preview
+            if not is_blackout:
+                engine = SceneEngine(scene, dmx, _govee)
+                engine.start()
+                _current_engine = engine
+    if hot_swap_engine is not None:
+        # Govee fan-out happens inside update_scene only if the govee subset
+        # of layers actually changed — keep the call outside _lock either way.
+        hot_swap_engine.update_scene(scene)
+        print(f"DIRECT_LIGHTS update -> {label} ({scene.get('id')})", flush=True)
+        return
     if is_blackout:
         # Network/serial calls outside the lock — match blackout()'s pattern.
         try:
