@@ -457,17 +457,171 @@
         {
           "type": "bar_chase",
           "colors": [
-            [255, 0, 0],
-            [255, 0, 200],
-            [0, 100, 255],
-            [255, 200, 0]
+            [
+              255,
+              0,
+              0
+            ],
+            [
+              255,
+              0,
+              200
+            ],
+            [
+              0,
+              100,
+              255
+            ],
+            [
+              255,
+              200,
+              0
+            ]
           ],
-          "rate_hz": 6.0,
+          "rate_hz": 6,
           "direction": "wrap",
           "tail": 0,
           "dim_active": 180,
           "dim_rest": 0,
           "wash": "include"
+        }
+      ]
+    },
+    {
+      "id": "scene-91jyzlx7",
+      "name": "Orange Blue Wash Chase Solo",
+      "category": "drop",
+      "layers": [
+        {
+          "type": "wash_chase",
+          "colors": [
+            [
+              255,
+              80,
+              0
+            ],
+            [
+              0,
+              80,
+              255
+            ]
+          ],
+          "amber": 0,
+          "hz": 2.15,
+          "dim_min": 0,
+          "dim_max": 61,
+          "strobe": 0
+        }
+      ]
+    },
+    {
+      "id": "scene-buk6ebkg",
+      "name": "Ping Pong Bar",
+      "category": "buildup",
+      "layers": [
+        {
+          "type": "bar_chase",
+          "colors": [
+            [
+              33,
+              110,
+              56
+            ]
+          ],
+          "amber": 46,
+          "rate_hz": 6.8,
+          "direction": "pingpong",
+          "tail": 0,
+          "dim_active": 255,
+          "dim_rest": 0,
+          "wash": "off"
+        },
+        {
+          "type": "random_flash",
+          "target": "wash",
+          "rgb": [
+            119,
+            221,
+            105
+          ],
+          "amber": 0,
+          "dim": 85,
+          "min_gap_s": 1.4,
+          "max_gap_s": 4.7,
+          "double_chance": 15,
+          "flash_ms": 50
+        }
+      ]
+    },
+    {
+      "id": "scene-8z4b5bgl",
+      "name": "New breakdown scene",
+      "category": "breakdown",
+      "layers": [
+        {
+          "type": "breathe",
+          "target": "all",
+          "colors": [
+            [
+              255,
+              247,
+              0
+            ],
+            [
+              153,
+              0,
+              255
+            ]
+          ],
+          "amber": 0,
+          "hz": 0.37,
+          "dim_min": 9,
+          "dim_max": 114
+        },
+        {
+          "type": "govee_preset",
+          "presets": {
+            "H6010": 3274
+          }
+        }
+      ]
+    },
+    {
+      "id": "scene-0c4t20fw",
+      "name": "flash",
+      "category": "outro",
+      "layers": [
+        {
+          "type": "random_flash",
+          "target": "all",
+          "rgb": [
+            255,
+            255,
+            255
+          ],
+          "amber": 0,
+          "dim": 57,
+          "min_gap_s": 1.1,
+          "max_gap_s": 5.3,
+          "double_chance": 78,
+          "flash_ms": 90
+        },
+        {
+          "type": "bar_chase",
+          "colors": [
+            [
+              255,
+              0,
+              0
+            ]
+          ],
+          "amber": 0,
+          "rate_hz": 1.5,
+          "direction": "wrap",
+          "tail": 0,
+          "dim_active": 82,
+          "dim_rest": 0,
+          "wash": "off"
         }
       ]
     }
