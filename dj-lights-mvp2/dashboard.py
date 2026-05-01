@@ -272,8 +272,10 @@ FIXTURES = {
                  "default": [[255, 255, 255]]},
                 {"key": "amber", "kind": "int", "min": 0, "max": 255, "default": 0,
                  "label": "amber", "unit": "/ 255"},
-                {"key": "rate_hz", "kind": "float", "min": 0.1, "max": 20.0, "step": 0.1,
-                 "default": 1.0, "label": "speed", "unit": "toggles/s"},
+                {"kind": "rate", "label": "speed",
+                 "hz_min": 0.1, "hz_max": 20.0, "hz_step": 0.1, "hz_default": 1.0,
+                 "hz_unit": "toggles/s",
+                 "beats_chips": [0.25, 0.5, 1, 2, 4, 8], "beats_default": 1},
                 {"key": "dim_active", "kind": "int", "min": 0, "max": 255, "default": 128,
                  "label": "on brightness", "unit": "/ 255"},
                 {"key": "dim_rest", "kind": "int", "min": 0, "max": 255, "default": 0,
@@ -289,8 +291,10 @@ FIXTURES = {
                  "default": [[255, 80, 0]]},
                 {"key": "amber", "kind": "int", "min": 0, "max": 255, "default": 0,
                  "label": "amber", "unit": "/ 255"},
-                {"key": "rate_hz", "kind": "float", "min": 0.5, "max": 20.0, "step": 0.1,
-                 "default": 4.0, "label": "speed", "unit": "zones/s"},
+                {"kind": "rate", "label": "speed",
+                 "hz_min": 0.5, "hz_max": 20.0, "hz_step": 0.1, "hz_default": 4.0,
+                 "hz_unit": "zones/s",
+                 "beats_chips": [0.25, 0.5, 1, 2, 4, 8], "beats_default": 1},
                 {"key": "direction", "kind": "select", "label": "direction",
                  "default": "wrap",
                  "options": [
@@ -378,8 +382,9 @@ FIXTURES = {
                  "label": "amber", "unit": "/ 255"},
                 {"key": "on_ms", "kind": "int", "min": 10, "max": 5000, "default": 80,
                  "label": "on time", "unit": "ms"},
-                {"key": "off_ms", "kind": "int", "min": 0, "max": 5000, "default": 40,
-                 "label": "off time", "unit": "ms"},
+                {"kind": "pulse_period", "label": "off time / period",
+                 "off_min": 0, "off_max": 5000, "off_default": 40, "off_unit": "ms",
+                 "beats_chips": [0.25, 0.5, 1, 2, 4, 8], "beats_default": 1},
                 {"key": "dim", "kind": "int", "min": 0, "max": 255, "default": 128,
                  "label": "brightness", "unit": "/ 255"},
             ],
@@ -1299,6 +1304,204 @@ function renderParam(grid, scene, effect, p) {
     const wrap = el('div'); wrap.style.gridColumn = '2 / span 2'; wrap.appendChild(sel);
     grid.appendChild(wrap); return;
   }
+  if (p.kind === 'rate') {
+    // BPM-locked rate widget. Writes effect.rate_hz xor effect.rate_beats —
+    // the engine treats rate_beats as winning when present, but we keep the
+    // JSON honest by clearing the other field on toggle.
+    renderRateWidget(grid, scene, effect, p);
+    return;
+  }
+  if (p.kind === 'pulse_period') {
+    renderPulsePeriodWidget(grid, scene, effect, p);
+    return;
+  }
+}
+
+// ---- Rate widget (Hz / Beats toggle) ----
+
+const RATE_BPM_REF = 120;  // reference BPM used when pre-filling rate_beats from rate_hz.
+
+function clearChildren(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+function nearestChip(chips, value) {
+  let best = chips[0], bestDist = Math.abs(value - chips[0]);
+  for (const c of chips) {
+    const d = Math.abs(value - c);
+    if (d < bestDist) { best = c; bestDist = d; }
+  }
+  return best;
+}
+
+function rateMode(effect) {
+  return (effect.rate_beats != null && effect.rate_beats > 0) ? 'beats' : 'hz';
+}
+
+function renderRateWidget(grid, scene, effect, p) {
+  const k = el('div', 'k'); k.textContent = p.label || 'speed'; grid.appendChild(k);
+  const wrap = el('div'); wrap.style.gridColumn = '2 / span 2';
+  wrap.style.display = 'flex'; wrap.style.flexDirection = 'column'; wrap.style.gap = '6px';
+
+  const toggle = el('select');
+  ['hz', 'beats'].forEach(m => {
+    const o = el('option'); o.value = m;
+    o.textContent = m === 'hz' ? `Hz (${p.hz_unit || 'Hz'})` : 'Beats (BPM-locked)';
+    toggle.appendChild(o);
+  });
+  toggle.value = rateMode(effect);
+  wrap.appendChild(toggle);
+
+  const body = el('div');
+  wrap.appendChild(body);
+  grid.appendChild(wrap);
+
+  function paint() {
+    clearChildren(body);
+    if (rateMode(effect) === 'hz') {
+      const cur = (effect.rate_hz != null) ? effect.rate_hz : p.hz_default;
+      const range = el('input'); range.type = 'range';
+      range.min = p.hz_min; range.max = p.hz_max; range.step = p.hz_step || 0.1;
+      range.value = cur;
+      const valSpan = el('div', 'val'); valSpan.textContent = (+cur).toFixed(2) + ' ' + (p.hz_unit || 'Hz');
+      range.oninput = () => {
+        const v = parseFloat(range.value);
+        effect.rate_hz = v;
+        delete effect.rate_beats;
+        valSpan.textContent = v.toFixed(2) + ' ' + (p.hz_unit || 'Hz');
+        setDirty(true); maybePushPreview(scene);
+      };
+      body.appendChild(range); body.appendChild(valSpan);
+    } else {
+      const chips = el('div'); chips.style.display = 'flex'; chips.style.gap = '4px'; chips.style.flexWrap = 'wrap';
+      const cur = (effect.rate_beats != null) ? effect.rate_beats : p.beats_default;
+      (p.beats_chips || [0.25, 0.5, 1, 2, 4, 8]).forEach(c => {
+        const b = el('button');
+        b.textContent = c < 1 ? `1/${Math.round(1/c)} beat` : `${c} beat${c === 1 ? '' : 's'}`;
+        if (Math.abs(c - cur) < 1e-9) b.style.outline = '2px solid #f80';
+        b.onclick = () => {
+          effect.rate_beats = c; delete effect.rate_hz;
+          setDirty(true); paint(); maybePushPreview(scene);
+        };
+        chips.appendChild(b);
+      });
+      const num = el('input'); num.type = 'number'; num.step = '0.05'; num.min = '0.05';
+      num.value = cur; num.style.width = '80px';
+      num.onchange = () => {
+        const v = parseFloat(num.value);
+        if (v > 0) {
+          effect.rate_beats = v; delete effect.rate_hz;
+          setDirty(true); paint(); maybePushPreview(scene);
+        }
+      };
+      const valSpan = el('div', 'val');
+      valSpan.textContent = `~${((RATE_BPM_REF / 60) / cur).toFixed(2)} ${p.hz_unit || 'Hz'} @ ${RATE_BPM_REF} BPM`;
+      body.appendChild(chips); body.appendChild(num); body.appendChild(valSpan);
+    }
+  }
+
+  toggle.onchange = () => {
+    if (toggle.value === 'beats') {
+      const curHz = (effect.rate_hz != null) ? effect.rate_hz : p.hz_default;
+      const rawBeats = (RATE_BPM_REF / 60) / Math.max(0.01, curHz);
+      effect.rate_beats = nearestChip(p.beats_chips || [0.25, 0.5, 1, 2, 4, 8], rawBeats);
+      delete effect.rate_hz;
+    } else {
+      const curBeats = (effect.rate_beats != null) ? effect.rate_beats : p.beats_default;
+      effect.rate_hz = +(((RATE_BPM_REF / 60) / Math.max(0.01, curBeats)).toFixed(2));
+      delete effect.rate_beats;
+    }
+    setDirty(true); paint(); maybePushPreview(scene);
+  };
+
+  paint();
+}
+
+function pulsePeriodMode(effect) {
+  return (effect.period_beats != null && effect.period_beats > 0) ? 'beats' : 'hz';
+}
+
+function renderPulsePeriodWidget(grid, scene, effect, p) {
+  const k = el('div', 'k'); k.textContent = p.label || 'off / period'; grid.appendChild(k);
+  const wrap = el('div'); wrap.style.gridColumn = '2 / span 2';
+  wrap.style.display = 'flex'; wrap.style.flexDirection = 'column'; wrap.style.gap = '6px';
+
+  const toggle = el('select');
+  ['hz', 'beats'].forEach(m => {
+    const o = el('option'); o.value = m;
+    o.textContent = m === 'hz' ? 'off time (ms)' : 'period (BPM-locked)';
+    toggle.appendChild(o);
+  });
+  toggle.value = pulsePeriodMode(effect);
+  wrap.appendChild(toggle);
+
+  const body = el('div');
+  wrap.appendChild(body);
+  grid.appendChild(wrap);
+
+  function paint() {
+    clearChildren(body);
+    if (pulsePeriodMode(effect) === 'hz') {
+      const cur = (effect.off_ms != null) ? effect.off_ms : p.off_default;
+      const range = el('input'); range.type = 'range';
+      range.min = p.off_min; range.max = p.off_max; range.step = 1;
+      range.value = cur;
+      const valSpan = el('div', 'val'); valSpan.textContent = cur + ' ' + (p.off_unit || 'ms');
+      range.oninput = () => {
+        const v = parseInt(range.value, 10);
+        effect.off_ms = v; delete effect.period_beats;
+        valSpan.textContent = v + ' ' + (p.off_unit || 'ms');
+        setDirty(true); maybePushPreview(scene);
+      };
+      body.appendChild(range); body.appendChild(valSpan);
+    } else {
+      const chips = el('div'); chips.style.display = 'flex'; chips.style.gap = '4px'; chips.style.flexWrap = 'wrap';
+      const cur = (effect.period_beats != null) ? effect.period_beats : p.beats_default;
+      (p.beats_chips || [0.25, 0.5, 1, 2, 4, 8]).forEach(c => {
+        const b = el('button');
+        b.textContent = c < 1 ? `1/${Math.round(1/c)} beat` : `${c} beat${c === 1 ? '' : 's'}`;
+        if (Math.abs(c - cur) < 1e-9) b.style.outline = '2px solid #f80';
+        b.onclick = () => {
+          effect.period_beats = c; delete effect.off_ms;
+          setDirty(true); paint(); maybePushPreview(scene);
+        };
+        chips.appendChild(b);
+      });
+      const num = el('input'); num.type = 'number'; num.step = '0.05'; num.min = '0.05';
+      num.value = cur; num.style.width = '80px';
+      num.onchange = () => {
+        const v = parseFloat(num.value);
+        if (v > 0) {
+          effect.period_beats = v; delete effect.off_ms;
+          setDirty(true); paint(); maybePushPreview(scene);
+        }
+      };
+      const valSpan = el('div', 'val');
+      const periodMs = Math.round((60 / RATE_BPM_REF) * cur * 1000);
+      valSpan.textContent = `~${periodMs} ms period @ ${RATE_BPM_REF} BPM`;
+      body.appendChild(chips); body.appendChild(num); body.appendChild(valSpan);
+    }
+  }
+
+  toggle.onchange = () => {
+    if (toggle.value === 'beats') {
+      const onMs = (effect.on_ms != null) ? effect.on_ms : 80;
+      const curOff = (effect.off_ms != null) ? effect.off_ms : p.off_default;
+      const periodMs = Math.max(1, onMs + curOff);
+      const rawBeats = (RATE_BPM_REF / 60) * (periodMs / 1000);
+      effect.period_beats = nearestChip(p.beats_chips || [0.25, 0.5, 1, 2, 4, 8], rawBeats);
+      delete effect.off_ms;
+    } else {
+      const curBeats = (effect.period_beats != null) ? effect.period_beats : p.beats_default;
+      const periodMs = Math.round((60 / RATE_BPM_REF) * curBeats * 1000);
+      const onMs = (effect.on_ms != null) ? effect.on_ms : 80;
+      effect.off_ms = Math.max(0, periodMs - onMs);
+      delete effect.period_beats;
+    }
+    setDirty(true); paint(); maybePushPreview(scene);
+  };
+
+  paint();
 }
 
 function defaultEffect(type) {
@@ -1312,6 +1515,8 @@ function defaultEffect(type) {
     else if (p.kind === 'color_list') base.colors = Array.isArray(p.default) ? p.default.map(c => c.slice()) : [[255,0,0],[0,0,255]];
     else if (p.kind === 'int' || p.kind === 'float') base[p.key] = p.default != null ? p.default : 0;
     else if (p.kind === 'select') base[p.key] = p.default != null ? p.default : (p.options && p.options[0] && p.options[0].value);
+    else if (p.kind === 'rate') base.rate_hz = p.hz_default != null ? p.hz_default : 1.0;
+    else if (p.kind === 'pulse_period') base.off_ms = p.off_default != null ? p.off_default : 40;
   });
   return base;
 }

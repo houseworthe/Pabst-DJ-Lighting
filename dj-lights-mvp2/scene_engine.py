@@ -13,13 +13,19 @@ Layer schema reference:
 
     solid         {type, target, rgb[r,g,b], amber, dim, strobe}
     breathe       {type, target, rgb, amber, hz, dim_min, dim_max, strobe}
-    chase         {type, rgb, amber, rate_hz, dim_active, dim_rest, strobe}
-                  (target is implicitly wash↔bar; not a per-zone chase)
-    bar_chase     {type, colors, rate_hz, direction, tail, dim_active,
-                   dim_rest, amber, strobe, wash}
-                  (per-zone sweep across the 4 bar zones)
-    pulse         {type, target, colors[[r,g,b],...], amber, on_ms, off_ms,
-                   dim, strobe}
+    chase         {type, rgb, amber, rate_hz | rate_beats, dim_active,
+                   dim_rest, strobe}
+                  (target is implicitly wash↔bar; not a per-zone chase.
+                   rate_beats = beats per toggle; tempo-locked when set.)
+    bar_chase     {type, colors, rate_hz | rate_beats, direction, tail,
+                   dim_active, dim_rest, amber, strobe, wash}
+                  (per-zone sweep across the 4 bar zones.
+                   rate_beats = beats per zone-step; tempo-locked when set.)
+    pulse         {type, target, colors[[r,g,b],...], amber, on_ms,
+                   off_ms | period_beats, dim, strobe}
+                  (period_beats = beats per cycle; tempo-locked when set.
+                   on_ms stays absolute even in beats mode — flashes don't
+                   stretch with BPM.)
     strobe        {type, target, rgb, amber, dim, rate}
     random_flash  {type, target, rgb, amber, dim, min_gap_s, max_gap_s,
                    double_chance, flash_ms}
@@ -80,6 +86,82 @@ def _paint_target(dmx, target: str, r: int, g: int, b: int, a: int, dim: int, st
     elif target in {"bar_z1", "bar_z2", "bar_z3", "bar_z4"}:
         zone = int(target[-1])
         dmx.set_bar_zone(zone, rr, gg, bb, aa, 255, strobe)
+
+
+RATE_HZ_MIN = 0.1   # floor matches dashboard slider min; below this a chase looks frozen.
+RATE_HZ_MAX = 40.0  # ceiling absorbs absurd rate_beats at high BPM (e.g. 0.0625 @ 200).
+FALLBACK_BPM = 120.0  # used only if state["_bpm"] is missing (engine never sets it).
+DT_MAX_S = 0.1      # phase integration clamp; absorbs tick stalls without leaping.
+
+
+def _resolve_rate_hz(layer: dict, bpm: float, default_hz: float) -> float:
+    """Effective Hz for chase / bar_chase. rate_beats wins if > 0; else
+    rate_hz; else default. Result clamped to [RATE_HZ_MIN, RATE_HZ_MAX]."""
+    rb = layer.get("rate_beats")
+    if isinstance(rb, (int, float)) and rb > 0:
+        hz = (float(bpm) / 60.0) / float(rb)
+    else:
+        hz = float(layer.get("rate_hz", default_hz))
+    return max(RATE_HZ_MIN, min(RATE_HZ_MAX, hz))
+
+
+def _advance_phase(state: dict, t: float, rate_hz: float) -> float:
+    """Integrate state['_phase'] += rate_hz * dt. Monotonic across BPM
+    changes — without this, a moving rate_hz makes step jump backward."""
+    last_t = state.get("_last_t")
+    if last_t is None:
+        state["_last_t"] = t
+        state.setdefault("_phase", 0.0)
+        return state["_phase"]
+    dt = t - last_t
+    if dt < 0:
+        dt = 0.0
+    elif dt > DT_MAX_S:
+        dt = DT_MAX_S
+    phase = state.get("_phase", 0.0) + rate_hz * dt
+    state["_phase"] = phase
+    state["_last_t"] = t
+    return phase
+
+
+def _resolve_pulse_period_ms(layer: dict, bpm: float) -> tuple[int, int]:
+    """Returns (on_ms, period_ms). period_beats wins if > 0; on_ms stays
+    absolute either way. If on_ms ≥ period_ms (extreme tempo / tiny period),
+    on_ms is clamped so the off phase is at least 20% of the period."""
+    on_ms = max(1, int(layer.get("on_ms", 80)))
+    pb = layer.get("period_beats")
+    if isinstance(pb, (int, float)) and pb > 0:
+        period_ms = max(1, int((60.0 / float(bpm)) * float(pb) * 1000.0))
+    else:
+        off_ms = max(0, int(layer.get("off_ms", 40)))
+        period_ms = max(1, on_ms + off_ms)
+    if on_ms >= period_ms:
+        on_ms = max(1, int(period_ms * 0.8))
+    return on_ms, period_ms
+
+
+def _advance_pulse_phase(state: dict, t: float, period_ms: int) -> tuple[int, float]:
+    """Integrate cycle phase in ms. Returns (cycle_idx, phase_ms in [0, period_ms))."""
+    last_t = state.get("_last_t")
+    if last_t is None:
+        state["_last_t"] = t
+        state.setdefault("_cycle_idx", 0)
+        state.setdefault("_phase_ms", 0.0)
+        return state["_cycle_idx"], state["_phase_ms"]
+    dt = t - last_t
+    if dt < 0:
+        dt = 0.0
+    elif dt > DT_MAX_S:
+        dt = DT_MAX_S
+    phase_ms = state.get("_phase_ms", 0.0) + dt * 1000.0
+    cycle_idx = state.get("_cycle_idx", 0)
+    while period_ms > 0 and phase_ms >= period_ms:
+        phase_ms -= period_ms
+        cycle_idx += 1
+    state["_phase_ms"] = phase_ms
+    state["_cycle_idx"] = cycle_idx
+    state["_last_t"] = t
+    return cycle_idx, phase_ms
 
 
 def _layer_solid(dmx, layer: dict, t: float, state: dict) -> None:
@@ -156,10 +238,11 @@ def _layer_chase(dmx, layer: dict, t: float, state: dict) -> None:
         rgb = layer.get("rgb") or [255, 255, 255]
         colors = [rgb]
     a = layer.get("amber", 0)
-    rate_hz = float(layer.get("rate_hz", 1.0))
+    bpm = state.get("_bpm", FALLBACK_BPM)
+    rate_hz = _resolve_rate_hz(layer, bpm, default_hz=1.0)
     dim_on = int(layer.get("dim_active", 128))
     dim_off = int(layer.get("dim_rest", 0))
-    step = int(t * rate_hz)
+    step = int(_advance_phase(state, t, rate_hz))
 
     if len(colors) >= 2:
         wash_rgb = colors[step % len(colors)][:3]
@@ -205,7 +288,8 @@ def _layer_bar_chase(dmx, layer: dict, t: float, state: dict) -> None:
     colors = layer.get("colors") or [[255, 255, 255]]
     if not colors:
         colors = [[255, 255, 255]]
-    rate_hz = float(layer.get("rate_hz", 4.0))
+    bpm = state.get("_bpm", FALLBACK_BPM)
+    rate_hz = _resolve_rate_hz(layer, bpm, default_hz=4.0)
     direction = layer.get("direction", "wrap")
     tail = max(0, min(3, int(layer.get("tail", 0))))
     dim_active = int(layer.get("dim_active", 255))
@@ -216,7 +300,7 @@ def _layer_bar_chase(dmx, layer: dict, t: float, state: dict) -> None:
     include_wash = wash_mode == "include"
 
     n = 6 if include_wash else 4
-    step = int(t * rate_hz)
+    step = int(_advance_phase(state, t, rate_hz))
 
     def head_for(s: int) -> int:
         if direction == "pingpong":
@@ -330,20 +414,22 @@ def _layer_dual_wash(dmx, layer: dict, t: float, state: dict) -> None:
 
 
 def _layer_pulse(dmx, layer: dict, t: float, state: dict) -> None:
-    """Alternate target between a color (from colors[], advancing per cycle) and blackout."""
+    """Alternate target between a color (from colors[], advancing per cycle)
+    and blackout.
+
+    Period: `period_beats` (BPM-locked) wins if > 0; otherwise on_ms+off_ms.
+    on_ms stays absolute either way — flashes don't stretch across tempos.
+    """
     target = layer.get("target", "all")
     if target not in DMX_TARGETS:
         return
     colors = layer.get("colors") or [[255, 255, 255]]
-    on_ms = max(1, int(layer.get("on_ms", 80)))
-    off_ms = max(0, int(layer.get("off_ms", 40)))
     a = layer.get("amber", 0)
     dim = layer.get("dim", 255)
     strobe = layer.get("strobe", 0)
-    period_ms = on_ms + off_ms
-    t_ms = t * 1000.0
-    cycle_idx = int(t_ms // period_ms)
-    phase_ms = t_ms - cycle_idx * period_ms
+    bpm = state.get("_bpm", FALLBACK_BPM)
+    on_ms, period_ms = _resolve_pulse_period_ms(layer, bpm)
+    cycle_idx, phase_ms = _advance_pulse_phase(state, t, period_ms)
     if phase_ms < on_ms:
         r, g, b = colors[cycle_idx % len(colors)][:3]
         _paint_target(dmx, target, _clamp(r), _clamp(g), _clamp(b), _clamp(a), _clamp(dim), _clamp(strobe))
@@ -449,10 +535,14 @@ class SceneEngine:
     last painted state so a scene swap is glitch-free.
     """
 
-    def __init__(self, scene: dict, dmx, govee) -> None:
+    def __init__(self, scene: dict, dmx, govee, bpm_fn: Optional[Callable[[], float]] = None) -> None:
         self.scene = scene
         self.dmx = dmx
         self.govee = govee
+        # bpm_fn returns a positive float on every tick. Renderers that
+        # use rate_beats / period_beats divide BPM by their beats value to
+        # get live Hz. None = fall through to FALLBACK_BPM (preview/tests).
+        self.bpm_fn: Callable[[], float] = bpm_fn or (lambda: FALLBACK_BPM)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         # Compiled DMX layers + per-layer state, swapped atomically by
@@ -604,12 +694,21 @@ class SceneEngine:
             with self._lock:
                 layers = self._dmx_layers
                 states = self._states
+            # One BPM read per tick — passed to every renderer via state.
+            # Renderers that don't use it ignore the key.
+            try:
+                bpm = float(self.bpm_fn())
+            except Exception:
+                bpm = FALLBACK_BPM
+            if not (bpm > 0):
+                bpm = FALLBACK_BPM
             try:
                 self.dmx.blackout()
                 for layer, state in zip(layers, states):
                     renderer = DMX_LAYER_RENDERERS.get(layer["type"])
                     if renderer is None:
                         continue
+                    state["_bpm"] = bpm
                     try:
                         renderer(self.dmx, layer, t, state)
                     except Exception as e:
@@ -648,6 +747,22 @@ def validate_scene(scene: dict) -> list[str]:
             tgt = layer.get("target")
             if tgt not in DMX_TARGETS:
                 errors.append(f"layer {i} ({ltype}): invalid target {tgt!r}")
+        if ltype in {"chase", "bar_chase"}:
+            has_hz = "rate_hz" in layer
+            has_beats = "rate_beats" in layer and (layer.get("rate_beats") or 0) > 0
+            if has_hz and has_beats:
+                errors.append(
+                    f"layer {i} ({ltype}): both rate_hz and rate_beats set; pick one"
+                )
+        if ltype == "pulse":
+            has_off = "off_ms" in layer
+            has_period_beats = (
+                "period_beats" in layer and (layer.get("period_beats") or 0) > 0
+            )
+            if has_off and has_period_beats:
+                errors.append(
+                    f"layer {i} (pulse): both off_ms and period_beats set; pick one"
+                )
         if ltype == "govee_preset":
             presets = layer.get("presets")
             if isinstance(presets, dict):

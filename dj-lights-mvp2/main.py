@@ -366,9 +366,35 @@ def _pause_watchdog() -> None:
         _pause_since = None
 
 
+def get_active_bpm() -> Optional[float]:
+    """Live BPM for whichever deck is currently active, or None.
+
+    Read from the prodj client object — the same field main.py uses for
+    SCENE_LOOKAHEAD_MS conversion. direct_lights filters out garbage values
+    and caches the last good reading, so returning None during transient
+    states (deck loading, no client yet) is safe.
+    """
+    if prodj is None or _active_deck is None:
+        return None
+    try:
+        cl = prodj.cl.getClient(_active_deck)
+    except Exception:
+        return None
+    if cl is None:
+        return None
+    bpm = getattr(cl, "bpm", None)
+    if bpm is None:
+        return None
+    try:
+        return float(bpm)
+    except (TypeError, ValueError):
+        return None
+
+
 def main() -> None:
     global prodj
     print("[main] starting dj-lights mvp2", flush=True)
+    direct_lights.set_bpm_provider(get_active_bpm)
     direct_lights.warm_up()
     # Dashboard runs in-process so /editor's preview button can call
     # direct_lights.apply_scene_preview() directly (no IPC).

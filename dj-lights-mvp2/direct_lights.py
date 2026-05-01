@@ -20,7 +20,7 @@ import os
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 BASE = os.path.dirname(__file__)
 DJ_LIGHTS = os.path.abspath(os.path.join(BASE, "..", "dj-lights"))
@@ -38,6 +38,40 @@ _dmx: Optional[DMX] = None
 _dmx_last_try: float = 0.0
 _dmx_retry_interval: float = 5.0
 _govee = GoveeClient()
+
+# Live BPM source. main.py registers a callable that returns the active
+# deck's bpm (or None when no deck is active / metadata is missing).
+# _bpm_cache holds the last value we accepted in [60, 200] — the realistic
+# DJ range. Reads outside that window are ignored, so a glitched 0 or 9999
+# packet doesn't snap the chase. Init 120 keeps preview / cold-start sensible.
+_BPM_FILTER_LO = 60.0
+_BPM_FILTER_HI = 200.0
+_bpm_cache: float = 120.0
+_bpm_source: Optional[Callable[[], Optional[float]]] = None
+
+
+def set_bpm_provider(fn: Callable[[], Optional[float]]) -> None:
+    """Register the live-BPM callable. Called once at startup from main.py."""
+    global _bpm_source
+    _bpm_source = fn
+
+
+def _bpm_for_engine() -> float:
+    """Return live BPM for the SceneEngine. Updates and returns the cache."""
+    global _bpm_cache
+    if _bpm_source is not None:
+        try:
+            raw = _bpm_source()
+        except Exception:
+            raw = None
+        if raw is not None:
+            try:
+                bpm = float(raw)
+            except (TypeError, ValueError):
+                bpm = 0.0
+            if _BPM_FILTER_LO <= bpm <= _BPM_FILTER_HI:
+                _bpm_cache = bpm
+    return _bpm_cache
 
 
 class _NullDMX:
@@ -135,7 +169,7 @@ def _run_scene(scene: dict, *, is_preview: bool, label: str) -> None:
             _current_scene_id = scene.get("id")
             _preview_active = is_preview
             if not is_blackout:
-                engine = SceneEngine(scene, dmx, _govee)
+                engine = SceneEngine(scene, dmx, _govee, bpm_fn=_bpm_for_engine)
                 engine.start()
                 _current_engine = engine
     if hot_swap_engine is not None:
