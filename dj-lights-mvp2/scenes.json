@@ -181,7 +181,7 @@
             255
           ],
           "amber": 0,
-          "dim": 112,
+          "dim": 60,
           "min_gap_s": 2,
           "max_gap_s": 4,
           "double_chance": 50,
