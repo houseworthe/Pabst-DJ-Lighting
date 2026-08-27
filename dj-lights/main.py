@@ -24,15 +24,52 @@ import threading
 import time
 from typing import Any, Optional
 
+BASE = os.path.dirname(__file__)
+
+# Mirror everything written to stdout/stderr into <repo>/logs/main.log so the
+# dashboard's tail (dashboard.py:LOG_PATH) sees live state regardless of how
+# the shell launched us. Without this, redirecting stdout (e.g. nohup ... >>
+# /tmp/x.log) leaves the dashboard parsing a stale file and showing "idle".
+_LOG_FILE_PATH = os.path.abspath(os.path.join(BASE, "..", "logs", "main.log"))
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+try:
+    os.makedirs(os.path.dirname(_LOG_FILE_PATH), exist_ok=True)
+    _log_fh = open(_LOG_FILE_PATH, "a", buffering=1)  # line-buffered
+    sys.stdout = _Tee(sys.__stdout__, _log_fh)
+    sys.stderr = _Tee(sys.__stderr__, _log_fh)
+except Exception as _e:
+    print(f"[main] could not open {_LOG_FILE_PATH}: {_e}", flush=True)
+
 # Show "New Player ..." + status packet logs from prodj so we can tell whether
-# decks are even being registered. Our own prints use [tag] so they still stand out.
+# decks are even being registered. Our own prints use [tag] so they still stand
+# out. basicConfig binds to the *current* sys.stderr — install the Tee first so
+# logger output is captured too.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-
-BASE = os.path.dirname(__file__)
-PRODJ_PATH = os.path.abspath(os.path.join(BASE, "..", "dj-lights", "python-prodj-link"))
+PRODJ_PATH = os.path.abspath(os.path.join(BASE, "python-prodj-link"))
 if PRODJ_PATH not in sys.path:
     sys.path.insert(0, PRODJ_PATH)
 
@@ -53,9 +90,16 @@ VCDJ_PLAYER_NUMBER = 17
 # current address at runtime rather than hardcoding.
 PREFERRED_IFACE_NAME = "en8"
 # prodj's PDBProvider writes to "databases/player-{pn}-{slot}.pdb" relative to
-# CWD ([pdbprovider.py:52](../dj-lights/python-prodj-link/prodj/data/pdbprovider.py:52)).
-# We launch from the repo root, so the file lands at <repo>/databases/.
-PDB_PATH = os.path.abspath(os.path.join(BASE, "..", "databases", "player-1-sd.pdb"))
+# CWD ([pdbprovider.py:52](python-prodj-link/prodj/data/pdbprovider.py:52)).
+# Resolve dynamically against the same cwd prodj uses, and pick the slot of
+# the loaded track — pinning to "sd" silently broke USB-loaded tracks, and
+# pinning to <repo>/databases/ silently broke launches from anywhere else.
+def _pdb_path_for(player_number: int, slot: Any) -> Optional[str]:
+    if not slot:
+        return None
+    return os.path.abspath(
+        os.path.join("databases", f"player-{player_number}-{slot}.pdb")
+    )
 
 _state_lock = threading.Lock()
 _active_deck: Optional[int] = None
@@ -84,10 +128,10 @@ _pause_since: Optional[float] = None
 prodj: Optional[ProDj] = None
 
 
-def find_anlz_path_in_pdb(track_id: int) -> Optional[str]:
-    if not os.path.exists(PDB_PATH):
+def find_anlz_path_in_pdb(track_id: int, pdb_path: str) -> Optional[str]:
+    if not os.path.exists(pdb_path):
         return None
-    with open(PDB_PATH, "rb") as f:
+    with open(pdb_path, "rb") as f:
         data = f.read()
     tid_bytes = struct.pack("<I", track_id)
     pattern = rb"/PIONEER/USBANLZ/P[0-9a-fA-F]{3}/[0-9a-fA-F]{8}/ANLZ0000\.DAT"
@@ -105,7 +149,10 @@ def find_anlz_path_in_pdb(track_id: int) -> Optional[str]:
 def fetch_pssi(loaded_player_number: int, slot: Any, track_id: int) -> Optional[dict[str, Any]]:
     if track_id in _pssi_cache:
         return _pssi_cache[track_id]
-    dat_path = find_anlz_path_in_pdb(track_id)
+    pdb_path = _pdb_path_for(loaded_player_number, slot)
+    if not pdb_path:
+        return None
+    dat_path = find_anlz_path_in_pdb(track_id, pdb_path)
     if not dat_path or prodj is None:
         return None
     ext_path = dat_path.replace(".DAT", ".EXT")
@@ -120,14 +167,21 @@ def fetch_pssi(loaded_player_number: int, slot: Any, track_id: int) -> Optional[
     )
     if client is None:
         return None
-    ext_data = prodj.nfs.enqueue_buffer_download(client.ip_addr, slot, ext_path)
-    if not ext_data:
+    # NFS + EXT parsing both raise on timeout / malformed data — catch here so
+    # callers see None and the groove fallback in load_track engages, instead
+    # of crashing the preload thread and leaving the track unanalyzed.
+    try:
+        ext_data = prodj.nfs.enqueue_buffer_download(client.ip_addr, slot, ext_path)
+        if not ext_data:
+            return None
+        db = UsbAnlzDatabase()
+        db.load_ext_buffer(ext_data)
+        if "song_structure" not in db:
+            return None
+        ss = db["song_structure"]
+    except Exception as e:
+        print(f"[pssi] track {track_id} fetch/parse failed: {e}", flush=True)
         return None
-    db = UsbAnlzDatabase()
-    db.load_ext_buffer(ext_data)
-    if "song_structure" not in db:
-        return None
-    ss = db["song_structure"]
     phrases = [
         {"type": e.get("kind"), "start_beat": e.get("beat", 0), "end_beat": 0}
         for e in ss.get("entries", [])
@@ -142,13 +196,23 @@ def fetch_pssi(loaded_player_number: int, slot: Any, track_id: int) -> Optional[
 
 def load_track(deck: int, loaded_player_number: int, slot: Any, track_id: int, metadata: dict) -> None:
     pssi = fetch_pssi(loaded_player_number, slot, track_id)
-    if pssi is None:
-        # No synthesized fallback — a generic intro/groove/drop/outro template
-        # drives every track into the same phrase boundaries and hides the
-        # real failure. Skip the track; on_client_change will keep whatever
-        # mode was last dispatched until a track with real PSSI loads.
-        print(f"[track] deck={deck} id={track_id} — PSSI unavailable, skipping", flush=True)
-        return
+    fallback = pssi is None
+    if fallback:
+        # No Rekordbox phrase analysis for this track. Old behavior was to skip
+        # entirely so failures were obvious — but that left the dance floor
+        # dark on any unanalyzed track, which is worse than a wrong scene.
+        # Compromise: synthesize a single `groove` phrase covering the track.
+        # We deliberately do NOT fake intro/drop/outro boundaries (the original
+        # objection to a "generic template") — groove just keeps lights moving
+        # on the beat. The log line below makes the fallback visible so the
+        # operator knows to re-analyze the track in Rekordbox.
+        bpm = metadata.get("bpm") or 0
+        duration = metadata.get("duration") or 0
+        end_beat = int(duration * bpm / 60) if duration and bpm else 99999
+        pssi = {
+            "mood": "low",
+            "phrases": [{"type": 2, "start_beat": 0, "end_beat": max(end_beat, 64)}],
+        }
     track = {
         "track_id": str(track_id),
         "title": metadata.get("title", "Unknown"),
@@ -160,8 +224,9 @@ def load_track(deck: int, loaded_player_number: int, slot: Any, track_id: int, m
     analysis = ingest_track_payload(track, pssi, [])
     with _state_lock:
         _analysis_by_track[track_id] = analysis
+    suffix = " [groove fallback — no phrase data]" if fallback else ""
     print(f"[track] deck={deck} id={track_id} \"{track['title']}\" — "
-          f"{len(analysis['phrases'])} phrases", flush=True)
+          f"{len(analysis['phrases'])} phrases{suffix}", flush=True)
     # Full phrase timeline as JSON so the dashboard can render the scene map.
     # Kept on a separate line so [track] stays human-readable at a glance.
     print(f"[phrases] deck={deck} id={track_id} {json.dumps(analysis['phrases'])}",
@@ -223,13 +288,49 @@ def on_client_change(player_number: int) -> None:
                 current_playing = bool(current_cl) and getattr(
                     current_cl, "play_state", "stopped"
                 ) in {"playing", "cue_play", "looping"}
-                if not current_playing:
+                # Follow the mixer. The XDJ reports which channels are on-air
+                # (channel fader up + crossfader). During a crossfade BOTH decks
+                # are `is_playing`, so play-state alone can't tell which track
+                # the room actually hears — that's how the lights latch the
+                # wrong (outgoing) deck. Hand off when this deck is on-air and
+                # the current active deck is NOT (the DJ has brought this one
+                # up), or when the current deck has stopped entirely. When both
+                # are on-air (mid-blend) we keep the current deck — no flap.
+                # on_air defaults False, so on rigs that don't report it this
+                # falls back to the old stop-based handoff (no regression).
+                this_on_air = bool(getattr(client, "on_air", False))
+                current_on_air = bool(current_cl) and bool(
+                    getattr(current_cl, "on_air", False)
+                )
+                # Tempo-master flag (Pioneer "MASTER"). The XDJ-XZ doesn't
+                # broadcast ch_on_air, so on_air is always False here; the
+                # master flag is the reliable "which deck is driving" signal,
+                # and it's exactly what the DJ means by "the master deck".
+                this_master = "master" in (getattr(client, "state", None) or [])
+                current_master = bool(current_cl) and (
+                    "master" in (getattr(current_cl, "state", None) or [])
+                )
+                if (
+                    (not current_playing)
+                    or (this_on_air and not current_on_air)
+                    or (this_master and not current_master)
+                ):
                     _active_deck = player_number
                     if track_id and track_id > 0:
                         _committed_track_by_deck[player_number] = track_id
                     _last_mode = None
-                    print(f"[deck] active -> {player_number} "
-                          f"(previous deck stopped)", flush=True)
+                    reason = ("previous deck stopped" if not current_playing
+                              else "on-air handoff" if this_on_air
+                              else "master handoff")
+                    print(f"[deck] active -> {player_number} ({reason})", flush=True)
+                else:
+                    # Diagnostic: a playing deck we DIDN'T switch to, and why —
+                    # reveals what flags the XDJ actually reports during a blend.
+                    print(f"[deck] keep {_active_deck}; deck {player_number} "
+                          f"playing but not switched "
+                          f"(this master={this_master} on_air={this_on_air}; "
+                          f"active master={current_master} on_air={current_on_air})",
+                          flush=True)
 
     # Pre-load analysis for ANY deck that loads a track, not just the active
     # one — so when a crossfade promotes the other deck, we already have its
@@ -285,6 +386,17 @@ def on_client_change(player_number: int) -> None:
     if not section:
         return
     mode = section["mode"]
+    # Scene pick uses `mode` (e.g. a whole breakdown→buildup climb is one
+    # held `build`), but intensity follows the finer `intensity_mode` sub-phrase
+    # so the curve dips on the breakdown and ramps on the buildup within that
+    # single scene. Falls back to `mode` for ordinary phrases.
+    intensity_mode = section.get("intensity_mode", mode)
+    # Push phrase boundaries every status packet (cheap), so the auto-curve
+    # always reads the right span — even if the lookahead grabbed a future
+    # phrase or PSSI shifted under us.
+    direct_lights.set_intensity_phrase(
+        section["start_beat"], section["end_beat"], intensity_mode
+    )
     if mode != _last_mode:
         _last_mode = mode
         scene = direct_lights.apply_mode(mode)
@@ -391,10 +503,27 @@ def get_active_bpm() -> Optional[float]:
         return None
 
 
+def get_active_beat() -> Optional[int]:
+    """Live beat count for the active deck, or None during transients."""
+    if prodj is None or _active_deck is None:
+        return None
+    try:
+        cl = prodj.cl.getClient(_active_deck)
+    except Exception:
+        return None
+    if cl is None:
+        return None
+    beat = getattr(cl, "beat_count", None)
+    if not isinstance(beat, int) or beat < 0:
+        return None
+    return beat
+
+
 def main() -> None:
     global prodj
-    print("[main] starting dj-lights mvp2", flush=True)
+    print("[main] starting dj-lights", flush=True)
     direct_lights.set_bpm_provider(get_active_bpm)
+    direct_lights.set_beat_provider(get_active_beat)
     direct_lights.warm_up()
     # Dashboard runs in-process so /editor's preview button can call
     # direct_lights.apply_scene_preview() directly (no IPC).

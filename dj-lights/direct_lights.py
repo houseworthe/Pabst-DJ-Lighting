@@ -23,11 +23,6 @@ import time
 from typing import Callable, Optional
 
 BASE = os.path.dirname(__file__)
-DJ_LIGHTS = os.path.abspath(os.path.join(BASE, "..", "dj-lights"))
-# append (not insert) so our own mvp2 modules (dashboard, scene_engine, etc.)
-# always shadow any older same-named files in dj-lights/.
-if DJ_LIGHTS not in sys.path:
-    sys.path.append(DJ_LIGHTS)
 
 from dmx_controller import DMX  # type: ignore
 from govee_lan import GoveeClient
@@ -72,6 +67,118 @@ def _bpm_for_engine() -> float:
             if _BPM_FILTER_LO <= bpm <= _BPM_FILTER_HI:
                 _bpm_cache = bpm
     return _bpm_cache
+
+
+# Intensity automation. Each scene runs at a scalar 0..1 — at 1.0 every layer
+# plays as authored, below 1 the engine attenuates dim/rate/strobe/density
+# fields per layer type (see scene_engine._apply_intensity).
+#
+# Two drivers feed this scalar:
+#   * Manual override — dashboard slider sets a fixed value until cleared.
+#   * Auto curve      — driven by PSSI phrase progress, varies by mode:
+#                       buildup ramps up, drop starts hot and decays, etc.
+# Manual wins. Cleared with set_intensity_manual(None) → auto resumes.
+
+_intensity_lock = threading.Lock()
+_intensity_phrase: dict = {"start_beat": 0, "end_beat": 0, "mode": None}
+_intensity_manual: Optional[float] = None  # None = auto curve drives
+_beat_source: Optional[Callable[[], Optional[int]]] = None
+
+
+# Per-mode auto curve. (low, high) maps progress-through-phrase to intensity.
+# Buildup ramps; drop starts hot and decays (the "explode then ease" feel);
+# steady categories are flat. Tuned to taste — tweak here, no engine changes.
+# Keyed by a phrase's `intensity_mode` (set in analysis.normalize_phrases). For
+# a combined `build` section the sub-phrases carry intensity_mode "breakdown"
+# (the calm base — low, so add-on layers stay gated off) then "buildup" (the
+# ramp to full at the drop, which brings the add-ons in). The lone "build" entry
+# is a defensive fallback if a phrase ever reaches here without a sub-mode.
+_INTENSITY_CURVE_BY_MODE: dict[str, tuple[float, float]] = {
+    "intro":     (0.45, 0.45),
+    "groove":    (0.75, 0.75),
+    "build":     (0.30, 1.00),
+    "buildup":   (0.30, 1.00),
+    "breakdown": (0.12, 0.32),
+    "drop":      (1.00, 0.55),
+    "outro":     (0.50, 0.50),
+}
+
+
+def set_beat_provider(fn: Callable[[], Optional[int]]) -> None:
+    """Register the live beat-count callable. Called once at startup from main.py."""
+    global _beat_source
+    _beat_source = fn
+
+
+def set_intensity_phrase(start_beat: int, end_beat: int, mode: Optional[str]) -> None:
+    """Snapshot the active phrase boundaries — auto curve uses these to compute progress."""
+    with _intensity_lock:
+        _intensity_phrase["start_beat"] = int(start_beat)
+        _intensity_phrase["end_beat"] = int(end_beat)
+        _intensity_phrase["mode"] = mode
+
+
+def set_intensity_manual(value: Optional[float]) -> None:
+    """Pin intensity to a fixed value, or pass None to clear and resume auto."""
+    global _intensity_manual
+    if value is None:
+        _intensity_manual = None
+        return
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return
+    if v != v:  # NaN guard
+        return
+    _intensity_manual = max(0.0, min(1.0, v))
+
+
+def _intensity_auto_value() -> float:
+    """Auto curve: phrase progress → intensity, shaped by current mode."""
+    with _intensity_lock:
+        phrase = dict(_intensity_phrase)
+    mode = phrase["mode"]
+    lo_hi = _INTENSITY_CURVE_BY_MODE.get(mode)
+    if lo_hi is None:
+        # Unknown / no phrase yet (preview, cold start). Play scenes as authored.
+        return 1.0
+    lo, hi = lo_hi
+    if _beat_source is None:
+        return lo
+    try:
+        beat = _beat_source()
+    except Exception:
+        beat = None
+    if beat is None:
+        return lo
+    span = phrase["end_beat"] - phrase["start_beat"]
+    if span <= 0:
+        return lo
+    progress = (float(beat) - phrase["start_beat"]) / float(span)
+    if progress < 0.0:
+        progress = 0.0
+    elif progress > 1.0:
+        progress = 1.0
+    return lo + (hi - lo) * progress
+
+
+def _intensity_for_engine() -> float:
+    """Called by SceneEngine on every tick. Manual wins; otherwise auto curve."""
+    manual = _intensity_manual
+    if manual is not None:
+        return manual
+    return _intensity_auto_value()
+
+
+def intensity_status() -> dict:
+    """Dashboard snapshot: current effective value, manual override, phrase."""
+    with _intensity_lock:
+        phrase = dict(_intensity_phrase)
+    return {
+        "value": _intensity_for_engine(),
+        "manual": _intensity_manual,
+        "phrase": phrase,
+    }
 
 
 class _NullDMX:
@@ -169,7 +276,13 @@ def _run_scene(scene: dict, *, is_preview: bool, label: str) -> None:
             _current_scene_id = scene.get("id")
             _preview_active = is_preview
             if not is_blackout:
-                engine = SceneEngine(scene, dmx, _govee, bpm_fn=_bpm_for_engine)
+                engine = SceneEngine(
+                    scene,
+                    dmx,
+                    _govee,
+                    bpm_fn=_bpm_for_engine,
+                    intensity_fn=_intensity_for_engine,
+                )
                 engine.start()
                 _current_engine = engine
     if hot_swap_engine is not None:
@@ -186,7 +299,7 @@ def _run_scene(scene: dict, *, is_preview: bool, label: str) -> None:
         except Exception:
             pass
         try:
-            _govee.turn(False)
+            _govee.turn(False, verify=True)
         except Exception:
             pass
     suffix = " [blackout]" if is_blackout else ""
@@ -212,6 +325,10 @@ def apply_mode(mode: str) -> Optional[dict]:
             return None
         _current_mode = mode
     scene = store.pick_scene(mode)
+    if scene is None and mode == "build":
+        # Migration / safety net: a combined build section falls back to the
+        # legacy buildup pool if no scenes are tagged `build` yet.
+        scene = store.pick_scene("buildup")
     if scene is None:
         print(f"DIRECT_LIGHTS mode -> {mode} (no scenes in category)", flush=True)
         blackout()
@@ -278,7 +395,7 @@ def blackout() -> None:
     except Exception:
         pass
     try:
-        _govee.turn(False)
+        _govee.turn(False, verify=True)
     except Exception:
         pass
 

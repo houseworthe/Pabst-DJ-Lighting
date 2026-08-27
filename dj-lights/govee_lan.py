@@ -338,10 +338,13 @@ class GoveeClient:
     def _send_device_steps(self, dev: dict, steps: list[dict]) -> None:
         """Run a sequence of commands against one device with serialization.
 
-        Each step: {lan: (cmd, data) | None, cap: dict | None}.
+        Each step: {lan: (cmd, data) | None, cap: dict | None, verify: bool}.
         LAN path preferred when the device has an IP AND the step has a LAN
         form. Steps without a LAN form (e.g. named scenes) always go to cloud,
         regardless of whether the device is also reachable over LAN.
+        `verify=True` fires both LAN (instant) and cloud (reliable, retried)
+        so a dropped UDP packet can't leave the device in a stale state —
+        used for off-correctness commands where "stuck on" is the failure.
         """
         dev_id = dev.get("device") or dev.get("ip") or ""
         ip = dev.get("ip")
@@ -350,10 +353,12 @@ class GoveeClient:
         with self._device_lock(dev_id):
             for step in steps:
                 self._wait_gap(dev_id)
+                lan_sent = False
                 if ip and step.get("lan"):
                     cmd, data = step["lan"]
                     _lan_send(ip, cmd, data)
-                elif can_cloud and step.get("cap"):
+                    lan_sent = True
+                if can_cloud and step.get("cap") and (not lan_sent or step.get("verify")):
                     _cloud_control(self._api_key, sku, dev["device"], step["cap"])
 
     def _broadcast_steps(self, steps_for_dev: callable) -> None:
@@ -370,14 +375,19 @@ class GoveeClient:
 
     # -- atomic operations --
 
-    def turn(self, on: bool) -> None:
+    def turn(self, on: bool, *, verify: bool = False) -> None:
         val = 1 if on else 0
         cap = {"type": "devices.capabilities.on_off", "instance": "powerSwitch", "value": val}
         lan = ("turn", {"value": val})
-        self._broadcast_steps(lambda d: [{"lan": lan, "cap": cap}])
+        self._broadcast_steps(lambda d: [{"lan": lan, "cap": cap, "verify": verify}])
 
-    def turn_skus(self, skus, on: bool) -> None:
-        """Turn on/off only the devices whose sku is in the given set."""
+    def turn_skus(self, skus, on: bool, *, verify: bool = False) -> None:
+        """Turn on/off only the devices whose sku is in the given set.
+
+        verify=True sends both LAN and cloud so a dropped UDP packet doesn't
+        leave the device stuck on — pass it for scene-boundary off commands
+        where the symptom is a COB strip that wouldn't power down.
+        """
         wanted = set(skus)
         if not wanted:
             return
@@ -388,7 +398,7 @@ class GoveeClient:
         def steps(dev):
             if dev.get("sku") not in wanted:
                 return []
-            return [{"lan": lan, "cap": cap}]
+            return [{"lan": lan, "cap": cap, "verify": verify}]
 
         self._broadcast_steps(steps)
 

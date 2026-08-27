@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .coverage
-dj-lights-mvp2/cache/
+dj-lights/cache/
 
 # Personal Claude Code settings — contains an API key.
 .claude/settings.local.json
@@ -19,3 +19,6 @@ databases/
 
 # macOS
 .DS_Store
+
+# Local browser-test artifacts
+.playwright-mcp/

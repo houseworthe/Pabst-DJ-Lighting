@@ -1,4 +1,4 @@
-# dj-lights MVP2
+# dj-lights
 
 Live DJ lighting driven by Pioneer Pro DJ Link. Single Python process listens
 to the XDJ-XZ, fetches Rekordbox PSSI phrase data for each loaded track, maps
@@ -64,13 +64,13 @@ load-bearing rules are:
 From the repo root, with the venv:
 
 ```bash
-./.venv/bin/python dj-lights-mvp2/main.py
+./.venv/bin/python dj-lights/main.py
 ```
 
 Dashboard (optional, runs independently; start it before or after main.py):
 
 ```bash
-./.venv/bin/python dj-lights-mvp2/dashboard.py
+./.venv/bin/python dj-lights/dashboard.py
 # -> http://localhost:8787
 ```
 
@@ -119,5 +119,5 @@ interceptor in `prodj.py` isn't firing.
 
 `Ctrl-C` or `SIGTERM`. The shutdown path runs `direct_lights.blackout()`
 (clears DMX + turns Govee off) then stops vcdj cleanly. If main.py hangs,
-`pkill -9 -f dj-lights-mvp2/main.py` is safe — vcdj sockets auto-close on
+`pkill -9 -f dj-lights/main.py` is safe — vcdj sockets auto-close on
 process exit.

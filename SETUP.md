@@ -28,9 +28,8 @@ python3.13 -m venv .venv
 import sys, os
 sys.path.insert(0, os.path.abspath('dj-lights/python-prodj-link'))
 sys.path.insert(0, os.path.abspath('dj-lights'))
-sys.path.insert(0, os.path.abspath('dj-lights-mvp2'))
 import numpy, sounddevice, pyaudio, netifaces, construct
-import direct_lights, runtime, bridge, analysis, scenes
+import direct_lights, bridge, analysis, scene_engine, dmx_controller
 from prodj.core.prodj import ProDj
 print('ok')
 "
@@ -38,9 +37,8 @@ print('ok')
 
 ## Hardware not yet present on this machine
 
-- Enttec Open DMX USB (`/dev/cu.usbserial-*`) — plug in before starting `lightd` or MVP2
-- Scarlett 2i2 — needed for the audio-reactive daemon (`dj-lights/lightd.py`)
-- XDJ-XZ on the Pro DJ Link ethernet subnet — needed for `live_bridge.py`
+- Enttec Open DMX USB (`/dev/cu.usbserial-*`) — plug in before starting `main.py`
+- XDJ-XZ on the Pro DJ Link ethernet subnet — needed for live mode dispatch
 
 ## Govee
 
@@ -50,7 +48,7 @@ Credentials live at `~/.config/govee/credentials.json`:
 {"api_key": "..."}
 ```
 
-MVP2 talks to Govee in-process via `dj-lights-mvp2/govee_lan.py` — LAN UDP
+`dj-lights` talks to Govee in-process via `dj-lights/govee_lan.py` — LAN UDP
 (~10ms) whenever a device has a cached LAN IP, cloud API (~200ms) as fallback.
 
 The `~/.local/bin/govee` CLI is a thin wrapper over the same module for manual
@@ -75,16 +73,8 @@ Always activate the venv (or use `.venv/bin/python` directly):
 source .venv/bin/activate
 ```
 
-MVP2 stack (single process — ProDJ Link + scene driver):
+Main stack (single process — ProDJ Link + scene driver, dashboard on :8787):
 
 ```bash
-python dj-lights-mvp2/main.py
-```
-
-Full `lightd` stack (original):
-
-```bash
-python dj-lights/lightd.py           # audio-reactive daemon (needs Scarlett + DMX)
-python dj-lights/dashboard.py        # :8420 — UI
-python dj-lights/prodjlink_bridge.py # ProDJ Link ingest
+python dj-lights/main.py
 ```

@@ -94,7 +94,56 @@ def normalize_phrases(pssi: Dict[str, Any]) -> List[Dict[str, Any]]:
         for i in range(len(squashed) - 1):
             squashed[i]["end_beat"] = squashed[i + 1]["start_beat"]
 
-    return _cap_long_drops(squashed)
+    return _coalesce_builds(_cap_long_drops(squashed))
+
+
+# Modes that make up the "climb toward a drop". A run of these that contains at
+# least one buildup is collapsed into a single `build` *scene* section (so the
+# scene is picked once and held — no mid-climb re-pick), while each sub-phrase
+# keeps its own `intensity_mode` so the auto-curve still dips on the breakdown
+# and ramps on the buildup. See _coalesce_builds.
+_BUILD_FAMILY = {"buildup", "breakdown"}
+
+
+def _coalesce_builds(phrases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Tag breakdown→buildup (and buildup→breakdown→buildup fake-outs) as one
+    held `build` section without merging the sub-phrases.
+
+    Every phrase gets `intensity_mode` = its original mode (drives the
+    per-mode intensity curve). Then, for each maximal run of consecutive
+    {buildup, breakdown} phrases that contains at least one buildup, the phrases
+    from the run start through the LAST buildup get `mode = "build"` (the
+    scene-pick key). Because they all share mode "build", main.py picks one
+    scene and holds it across the whole climb; because each keeps its
+    intensity_mode, the curve still dips during the breakdown and ramps during
+    the buildup.
+
+    Trailing breakdowns after the last buildup are left as `breakdown` — that's
+    a wind-down (e.g. `buildup breakdown outro`), not part of the build, so it
+    keeps its own calm look.
+    """
+    for p in phrases:
+        p.setdefault("intensity_mode", p["mode"])
+
+    n = len(phrases)
+    i = 0
+    while i < n:
+        if phrases[i]["mode"] not in _BUILD_FAMILY:
+            i += 1
+            continue
+        j = i
+        while j < n and phrases[j]["mode"] in _BUILD_FAMILY:
+            j += 1
+        run = range(i, j)
+        last_buildup = max(
+            (k for k in run if phrases[k]["mode"] == "buildup"), default=None
+        )
+        if last_buildup is not None:
+            for k in range(i, last_buildup + 1):
+                phrases[k]["intensity_mode"] = phrases[k]["mode"]
+                phrases[k]["mode"] = "build"
+        i = j
+    return phrases
 
 
 def _cap_long_drops(phrases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

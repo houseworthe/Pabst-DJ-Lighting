@@ -9,18 +9,26 @@
 
 ## DMX Chain
 ```
-Mac mini USB → Enttec Open DMX (5-pin) → 5-to-3 adapter → Tetra 12 #1 (d.001)
-Tetra 12 #1 DMX OUT → Tetra 12 #2 (d.001, same address — both respond identically)
-Tetra 12 #2 → Tetra Bar (d.008, via VenueLink, NOT DMX cable)
+Laptop USB → Enttec Open DMX (5-pin) → 5-to-3 adapter → Tetra 12 #1 (d.001)
+Tetra 12 #1 DMX OUT → Tetra 12 #2 (d.007)
+Tetra 12 #2 DMX OUT → Tetra Bar (d.013, last in chain)
 ```
 
-**Both Tetra 12s are on d.001** — they can't be individually controlled.
+**Each fixture now has its own DMX address** (was previously both 12s mirrored on d.001).
+The two Tetra 12s can be controlled independently. Addresses are spaced 6 apart so the
+6-ch fixtures don't overlap; the 24-ch Bar is last so its channels 13-36 don't collide.
+
+Manuals: `~/Documents/Personal-Projects/dj-lighting-ultron/Hardware Manuals/`
+(Venue Tetra 12, Tetra Bar, Venue Dongle).
 
 ## DMX Addressing
 | Fixture | Address | Mode | Channels |
 |---------|---------|------|----------|
-| Tetra 12 #1 & #2 | d.001 | 6-ch | 1-6 (R,G,B,A,Dimmer,Strobe) |
-| Tetra Bar | d.008 | 24-ch | 8-31 (4 zones × 6ch) |
+| Tetra 12 #1 | d.001 | 6-ch | 1-6 (R,G,B,A,Dimmer,Strobe) |
+| Tetra 12 #2 | d.007 | 6-ch | 7-12 (R,G,B,A,Dimmer,Strobe) |
+| Tetra Bar | d.013 | 24-ch | 13-36 (4 zones × 6ch) |
+
+Set in `dmx_controller.py`: `TETRA12_ADDRS = [1, 7]`, `TETRA_BAR_ADDR = 13`.
 
 ### Tetra 12 Channel Map (6-ch)
 | Offset | Function | Notes |
@@ -162,4 +170,4 @@ dmx.send_frame()                        # transmit 512-byte universe
 ## Known Issue: Fixtures Hold State
 DMX fixtures (Tetras + Bar) latch their last received values. When lightd stops without sending a blackout, or if the USB connection drops, lights stay on. Sending blackout frames after the fact may not work if the FTDI device lost its connection. **Fix: power cycle the fixtures** (switch on back of each unit).
 
-TODO: Add a proper blackout on daemon shutdown (before skipping ftdi_usb_close).
+`lightd` sends a blackout frame on shutdown then skips `ftdi_usb_close()` (segfaults/glitches on macOS). The standalone `dmx_controller.py` now does the same — its `close()` is a no-op that lets the OS reclaim the USB handle. This fixed the fixtures "tweaking" (flickering erratically) at the end of `dmx_controller.py test`.

@@ -21,6 +21,11 @@ Layer schema reference:
                    dim_active, dim_rest, amber, strobe, wash}
                   (per-zone sweep across the 4 bar zones.
                    rate_beats = beats per zone-step; tempo-locked when set.)
+    bar_shoot     {type, colors, mode, retract, shoot_ms, hold_ms,
+                   retract_ms, gap_ms, dim_active, dim_rest, amber, strobe,
+                   wash}
+                  (launch across the 4 bar zones then recoil. mode ∈
+                   {out,in,center,split}; retract ∈ {recede,fade}.)
     pulse         {type, target, colors[[r,g,b],...], amber, on_ms,
                    off_ms | period_beats, dim, strobe}
                   (period_beats = beats per cycle; tempo-locked when set.
@@ -29,6 +34,14 @@ Layer schema reference:
     strobe        {type, target, rgb, amber, dim, rate}
     random_flash  {type, target, rgb, amber, dim, min_gap_s, max_gap_s,
                    double_chance, flash_ms}
+    popcorn       {type, target, mode, colors[[r,g,b],...], amber,
+                   max_brightness, min_brightness, flash_rate_hz, decay_ms,
+                   strobe}
+                  (each addressable unit pops to max and decays linearly to
+                   min over decay_ms. flash_rate_hz is the *combined* rate
+                   across all units in scope. mode='solo' enforces one pop
+                   at a time (no overlap); 'overlap' allows simultaneous
+                   pops. target ∈ {all, wash, bar_all}.)
     govee_rgb     {type, skus[sku,...], rgb, brightness?}
     govee_preset  {type, skus[sku,...], param_id}
 
@@ -51,7 +64,15 @@ from typing import Any, Callable, Optional
 TICK_S = 0.03  # 30ms render tick; pulse timing uses monotonic clock, so jitter is invisible.
 
 DMX_TARGETS = {"all", "wash", "wash_1", "wash_2", "bar_all", "bar_z1", "bar_z2", "bar_z3", "bar_z4"}
-LAYER_TYPES = {"solid", "breathe", "chase", "bar_chase", "wash_pingpong", "wash_chase", "dual_wash", "pulse", "strobe", "random_flash", "govee_rgb", "govee_preset"}
+LAYER_TYPES = {"solid", "breathe", "chase", "bar_chase", "wash_pingpong", "wash_chase", "dual_wash", "pulse", "strobe", "random_flash", "popcorn", "bar_shoot", "bar_flow", "acid_kaleidoscope", "acid_bloom", "govee_rgb", "govee_preset"}
+
+# Per-unit target lists for popcorn — the layer addresses each unit
+# independently so each "light" pops on its own schedule.
+POPCORN_UNIT_MAP = {
+    "all": ("wash_1", "wash_2", "bar_z1", "bar_z2", "bar_z3", "bar_z4"),
+    "wash": ("wash_1", "wash_2"),
+    "bar_all": ("bar_z1", "bar_z2", "bar_z3", "bar_z4"),
+}
 
 
 def _clamp(v: float, lo: float = 0, hi: float = 255) -> int:
@@ -86,6 +107,61 @@ def _paint_target(dmx, target: str, r: int, g: int, b: int, a: int, dim: int, st
     elif target in {"bar_z1", "bar_z2", "bar_z3", "bar_z4"}:
         zone = int(target[-1])
         dmx.set_bar_zone(zone, rr, gg, bb, aa, 255, strobe)
+
+
+# ---------------------------------------------------------------------------
+# Acid primitives — continuous-hue procedural effects
+# ---------------------------------------------------------------------------
+#
+# The chase/pulse family all cycle through a *fixed* palette one slot at a
+# time. The "acid" layers instead compute hue continuously (rotating rainbows,
+# per-segment random walks) so the rig never lands on a flat repeating frame.
+# They address the rig as 6 spatial segments, left → right across the room:
+#
+#     seg 0     = wash_1 (Tetra 12 left, d.001)
+#     seg 1..4  = bar zones 1..4 (Tetra Bar, center)
+#     seg 5     = wash_2 (Tetra 12 right, d.007)
+#
+# so a hue that sweeps with the segment index reads as a physical L→R wipe.
+
+ACID_N = 6  # number of spatial segments
+
+
+def _hsv_to_rgb(h: float, s: float, v: float) -> tuple[int, int, int]:
+    """HSV → 0..255 RGB. h in degrees (wrapped), s and v in [0, 1].
+
+    This is the workhorse for every acid layer — continuous hue is the whole
+    point, so we never quantize to a palette."""
+    h = h % 360.0
+    s = max(0.0, min(1.0, s))
+    v = max(0.0, min(1.0, v))
+    c = v * s
+    x = c * (1 - abs((h / 60.0) % 2 - 1))
+    m = v - c
+    if h < 60:
+        rp, gp, bp = c, x, 0.0
+    elif h < 120:
+        rp, gp, bp = x, c, 0.0
+    elif h < 180:
+        rp, gp, bp = 0.0, c, x
+    elif h < 240:
+        rp, gp, bp = 0.0, x, c
+    elif h < 300:
+        rp, gp, bp = x, 0.0, c
+    else:
+        rp, gp, bp = c, 0.0, x
+    return _clamp((rp + m) * 255), _clamp((gp + m) * 255), _clamp((bp + m) * 255)
+
+
+def _acid_paint_segment(dmx, idx: int, r: int, g: int, b: int, a: int = 0, strobe: int = 0) -> None:
+    """Paint one of the 6 spatial segments (see ACID_N comment). Brightness is
+    baked into RGB by the caller, so we always pass dim=255 to the fixture."""
+    if idx <= 0:
+        dmx.set_12s_one(0, r, g, b, a, 255, strobe)   # wash_1 (left)
+    elif idx >= ACID_N - 1:
+        dmx.set_12s_one(1, r, g, b, a, 255, strobe)   # wash_2 (right)
+    else:
+        dmx.set_bar_zone(idx, r, g, b, a, 255, strobe)  # seg 1..4 -> bar zone 1..4
 
 
 RATE_HZ_MIN = 0.1   # floor matches dashboard slider min; below this a chase looks frozen.
@@ -502,6 +578,395 @@ def _layer_random_flash(dmx, layer: dict, t: float, state: dict) -> None:
             return
 
 
+_POPCORN_SOLO_THRESHOLD = 0.05  # in solo mode, treat a unit below 5% as "done" so the next pop can fire while the tail finishes — keeps cadence from being strictly bounded by decay_ms.
+
+
+def _layer_popcorn(dmx, layer: dict, t: float, state: dict) -> None:
+    """Random per-unit pops with linear decay back to a baseline.
+
+    Each unit (per POPCORN_UNIT_MAP[target]) holds an independent brightness
+    `level` in [0.0, 1.0]. On each tick:
+      - level decays toward 0 at rate (1 / decay_ms).
+      - In `solo` mode, at most one pop is active at a time: a single
+        per-tick roll at probability (flash_rate_hz * dt) fires, and only
+        if no in-scope unit is still meaningfully lit (level > 0.05). Pop
+        target is uniformly random across in-scope units.
+      - In `overlap` mode, every unit independently rolls
+        (flash_rate_hz * dt / n) — multiple units can be lit simultaneously,
+        which is what produces the "double-flash" feel.
+      - Painted brightness is min_brightness + (max - min) * level, so a unit
+        at rest sits at min_brightness and a fresh pop reaches max_brightness.
+
+    Rate is *combined across all units* in scope — pick 5 Hz and you get ~5
+    pops per second total regardless of whether scope is wash (2), bar (4),
+    or everything (6). Keeps visual cadence stable when target changes.
+    Note: in solo mode actual rate is capped near 1/decay_seconds because
+    new pops wait for the previous one to finish.
+    """
+    target = layer.get("target", "all")
+    units = POPCORN_UNIT_MAP.get(target)
+    if not units:
+        return
+
+    colors_in = layer.get("colors") or [[255, 255, 255]]
+    colors = [c[:3] for c in colors_in if isinstance(c, (list, tuple)) and len(c) >= 3]
+    if not colors:
+        colors = [[255, 255, 255]]
+    max_b = _clamp(layer.get("max_brightness", 255))
+    min_b = _clamp(layer.get("min_brightness", 0))
+    if min_b > max_b:
+        min_b = max_b
+    span = max_b - min_b
+    flash_rate = max(0.0, float(layer.get("flash_rate_hz", 5.0)))
+    decay_ms = max(20.0, float(layer.get("decay_ms", 250.0)))
+    decay_per_s = 1000.0 / decay_ms  # level units per second
+    amber = _clamp(layer.get("amber", 0))
+    strobe = _clamp(layer.get("strobe", 0))
+    mode = layer.get("mode", "solo")
+    if mode not in {"solo", "overlap"}:
+        mode = "solo"
+
+    last_t = state.get("_last_t")
+    if last_t is None:
+        dt = 0.0
+    else:
+        dt = t - last_t
+        if dt < 0:
+            dt = 0.0
+        elif dt > DT_MAX_S:
+            dt = DT_MAX_S
+    state["_last_t"] = t
+
+    # Per-unit state: {level: float, color: [r,g,b]}.
+    units_state = state.setdefault("_units", {})
+    decay_step = decay_per_s * dt
+    n = len(units)
+
+    # 1. Decay every in-scope unit. Out-of-scope state lingers harmlessly
+    #    (we never render it; tick-start blackout in the engine handles
+    #    the off pixels).
+    for unit_name in units:
+        u = units_state.get(unit_name)
+        if u is None:
+            u = {"level": 0.0, "color": colors[0]}
+            units_state[unit_name] = u
+        u["level"] = max(0.0, u["level"] - decay_step)
+
+    # 2. Trigger phase. Gating depends on mode.
+    if mode == "solo":
+        any_active = any(
+            units_state[u]["level"] > _POPCORN_SOLO_THRESHOLD for u in units
+        )
+        if not any_active:
+            p = min(1.0, flash_rate * dt)
+            if p > 0 and random.random() < p:
+                chosen = random.choice(units)
+                units_state[chosen]["level"] = 1.0
+                units_state[chosen]["color"] = random.choice(colors)
+    else:  # overlap — original per-unit rolling, multiple units can be active
+        p_per_unit = min(1.0, flash_rate * dt / n) if n else 0.0
+        if p_per_unit > 0:
+            for unit_name in units:
+                if random.random() < p_per_unit:
+                    units_state[unit_name]["level"] = 1.0
+                    units_state[unit_name]["color"] = random.choice(colors)
+
+    # 3. Render every in-scope unit at its current level.
+    for unit_name in units:
+        u = units_state[unit_name]
+        dim = min_b + int(round(span * u["level"]))
+        cr, cg, cb = u["color"][:3]
+        _paint_target(dmx, unit_name, _clamp(cr), _clamp(cg), _clamp(cb), amber, dim, strobe)
+
+
+def _layer_acid_kaleidoscope(dmx, layer: dict, t: float, state: dict) -> None:
+    """Kaleidoscope Meltdown — a full rainbow rotates across the rig at
+    `spin_dps` degrees/sec. Each segment is offset by `spread_deg` (a
+    non-harmonic value like 47° keeps the segments from ever lining up), and
+    each segment breathes its brightness on its own slightly-detuned sine, so
+    the whole rig shimmers and never lands on a flat frame.
+
+      spin_dps    rotation speed of the base hue (°/s; negative spins the
+                  other way).
+      spread_deg  hue offset between adjacent segments.
+      breathe_hz  base breathing frequency; segment i runs ~18% faster per
+                  index so the breaths drift in and out of phase.
+      sat         color saturation (0..255).
+      dim_min/max breathing brightness floor/ceiling (0..255).
+    """
+    spin = float(layer.get("spin_dps", 40.0))
+    spread = float(layer.get("spread_deg", 47.0))
+    breathe_hz = float(layer.get("breathe_hz", 0.3))
+    sat = _clamp(layer.get("sat", 255)) / 255.0
+    dim_min = float(layer.get("dim_min", 20))
+    dim_max = float(layer.get("dim_max", 220))
+    base = spin * t
+    for i in range(ACID_N):
+        hue = base + i * spread
+        f = breathe_hz * (1.0 + 0.18 * i)
+        wave = 0.5 - 0.5 * math.cos(2 * math.pi * f * t + i * 1.3)
+        v = (dim_min + (dim_max - dim_min) * wave) / 255.0
+        r, g, b = _hsv_to_rgb(hue, sat, v)
+        _acid_paint_segment(dmx, i, r, g, b)
+
+
+def _layer_acid_bloom(dmx, layer: dict, t: float, state: dict) -> None:
+    """Fractal Seizure Bloom — controlled chaos.
+
+    Every segment owns a hue that random-walks independently. On top of that:
+    random brightness spikes bloom a segment to full and decay back; white
+    sparks flash a segment near-white; the whole rig periodically inverts to
+    complementary hues; and random "color cannon" stabs slam a single segment
+    to a fresh saturated hue at full brightness. No two frames repeat.
+
+      walk_speed      hue random-walk magnitude (°/s, gaussian).
+      spike_rate      brightness blooms per second (combined).
+      spark_rate      white sparks per second (combined).
+      cannon_rate     color-cannon stabs per second (combined).
+      invert_period_s seconds between whole-rig complementary inversions.
+      base_dim        resting brightness between blooms (0..255).
+      sat             base saturation (0..255).
+      decay_ms        bloom/spark decay time.
+    """
+    walk_speed = float(layer.get("walk_speed", 70.0))
+    spike_rate = float(layer.get("spike_rate", 4.0))
+    spark_rate = float(layer.get("spark_rate", 1.5))
+    cannon_rate = float(layer.get("cannon_rate", 0.8))
+    invert_period = max(0.5, float(layer.get("invert_period_s", 4.0)))
+    base_dim = _clamp(layer.get("base_dim", 40))
+    sat = _clamp(layer.get("sat", 255)) / 255.0
+    decay_ms = max(20.0, float(layer.get("decay_ms", 300.0)))
+
+    last_t = state.get("_last_t")
+    if last_t is None:
+        dt = 0.0
+    else:
+        dt = t - last_t
+        if dt < 0:
+            dt = 0.0
+        elif dt > DT_MAX_S:
+            dt = DT_MAX_S
+    state["_last_t"] = t
+
+    hues = state.get("_hues")
+    if hues is None:
+        # Seed by index so the very first frame is already a spread, not a
+        # single color (random module is fine here — visual, not security).
+        hues = [(i * 360.0 / ACID_N) for i in range(ACID_N)]
+        state["_hues"] = hues
+        state["_levels"] = [0.0] * ACID_N
+        state["_sparks"] = [0.0] * ACID_N
+        state["_next_invert"] = invert_period
+    levels = state["_levels"]
+    sparks = state["_sparks"]
+
+    decay_step = (1000.0 / decay_ms) * dt
+
+    state["_next_invert"] -= dt
+    if state["_next_invert"] <= 0.0:
+        state["_next_invert"] += invert_period
+        for i in range(ACID_N):
+            hues[i] = (hues[i] + 180.0) % 360.0
+
+    for i in range(ACID_N):
+        hues[i] = (hues[i] + random.gauss(0.0, walk_speed) * dt) % 360.0
+        levels[i] = max(0.0, levels[i] - decay_step)
+        sparks[i] = max(0.0, sparks[i] - decay_step * 1.6)  # sparks die faster
+
+    if random.random() < min(1.0, spike_rate * dt):
+        levels[random.randrange(ACID_N)] = 1.0
+    if random.random() < min(1.0, spark_rate * dt):
+        sparks[random.randrange(ACID_N)] = 1.0
+    if random.random() < min(1.0, cannon_rate * dt):
+        j = random.randrange(ACID_N)
+        hues[j] = random.uniform(0.0, 360.0)
+        levels[j] = 1.0
+
+    for i in range(ACID_N):
+        spark = sparks[i]
+        v = (base_dim + (255 - base_dim) * levels[i]) / 255.0
+        if spark > 0.02:
+            # desaturate toward white as the spark peaks
+            r, g, b = _hsv_to_rgb(hues[i], sat * (1.0 - spark), max(v, spark))
+        else:
+            r, g, b = _hsv_to_rgb(hues[i], sat, v)
+        _acid_paint_segment(dmx, i, r, g, b)
+
+
+# Per-zone "arrival slot" for each shoot mode. Lower slot = lit earlier as the
+# shoot front advances; ties (center / split) light two zones at once.
+_BAR_SHOOT_SLOTS = {
+    "out":    {1: 0, 2: 1, 3: 2, 4: 3},   # left  → right
+    "in":     {4: 0, 3: 1, 2: 2, 1: 3},   # right → left
+    "center": {2: 0, 3: 0, 1: 1, 4: 1},   # middle → edges
+    "split":  {1: 0, 4: 0, 2: 1, 3: 1},   # edges  → middle
+}
+
+
+def _layer_bar_shoot(dmx, layer: dict, t: float, state: dict) -> None:
+    """Launch-and-recoil across the 4 bar zones — the "shootout".
+
+    One cycle runs four acts back to back:
+      shoot   (shoot_ms)   light fills the zones in `mode` order, fast.
+      hold    (hold_ms)    every zone sits at dim_active.
+      retract (retract_ms) brightness is pulled back. `retract`:
+                             "recede" — zones go dark in reverse arrival
+                                        order, so the light visibly recoils
+                                        toward where it launched from.
+                             "fade"   — every lit zone dims uniformly down to
+                                        dim_rest (a flat brightness drain).
+      gap     (gap_ms)      everything rests at dim_rest before the next launch.
+
+    `mode` picks the shoot axis:
+      "out"    bar fills left→right, recoils right→left.
+      "in"     bar fills right→left, recoils left→right.
+      "center" fills from the middle two zones outward, recoils inward.
+      "split"  fills from the outer zones inward, recoils outward.
+
+    `colors` advances one slot per launch, so a multi-color palette fires a
+    different color each cycle. `wash="match"` mirrors the rig-wide average
+    brightness onto both Tetra 12s in the launch color (otherwise the wash
+    stays dark via the engine's per-tick blackout).
+    """
+    colors = layer.get("colors") or [[255, 255, 255]]
+    if not colors:
+        colors = [[255, 255, 255]]
+    slots = _BAR_SHOOT_SLOTS.get(layer.get("mode", "out"), _BAR_SHOOT_SLOTS["out"])
+    retract_mode = layer.get("retract", "recede")
+    shoot_ms = max(1, int(layer.get("shoot_ms", 120)))
+    hold_ms = max(0, int(layer.get("hold_ms", 40)))
+    retract_ms = max(1, int(layer.get("retract_ms", 220)))
+    gap_ms = max(0, int(layer.get("gap_ms", 180)))
+    dim_active = int(layer.get("dim_active", 255))
+    dim_rest = int(layer.get("dim_rest", 0))
+    amber = layer.get("amber", 0)
+    strobe = _clamp(int(layer.get("strobe", 0)))
+    wash_mode = layer.get("wash", "off")
+
+    period_ms = shoot_ms + hold_ms + retract_ms + gap_ms
+    t_ms = t * 1000.0
+    phase = t_ms % period_ms
+    cycle = int(t_ms // period_ms)
+
+    max_slot = max(slots.values())
+    span_slots = max_slot + 1  # arrival steps the front walks across
+
+    # Per-zone fill level in [0, 1]; 0 → dim_rest, 1 → dim_active.
+    levels: dict[int, float] = {}
+    if phase < shoot_ms:
+        front = (phase / shoot_ms) * span_slots
+        for z, slot in slots.items():
+            levels[z] = max(0.0, min(1.0, front - slot))
+    elif phase < shoot_ms + hold_ms:
+        for z in slots:
+            levels[z] = 1.0
+    elif phase < shoot_ms + hold_ms + retract_ms:
+        rp = (phase - shoot_ms - hold_ms) / retract_ms  # 0..1
+        if retract_mode == "fade":
+            for z in slots:
+                levels[z] = max(0.0, 1.0 - rp)
+        else:  # recede — last-arrived zones darken first, light recoils
+            drain = rp * span_slots
+            for z, slot in slots.items():
+                rev = max_slot - slot
+                levels[z] = max(0.0, min(1.0, 1.0 - (drain - rev)))
+    else:
+        for z in slots:
+            levels[z] = 0.0
+
+    r, g, b = colors[cycle % len(colors)][:3]
+    bspan = dim_active - dim_rest
+    for z in (1, 2, 3, 4):
+        dim = dim_rest + int(round(bspan * levels.get(z, 0.0)))
+        rr, gg, bb_, aa = _scale(r, g, b, amber, dim)
+        dmx.set_bar_zone(z, rr, gg, bb_, aa, 255, strobe)
+
+    if wash_mode == "match":
+        avg = sum(levels.get(z, 0.0) for z in (1, 2, 3, 4)) / 4.0
+        wdim = dim_rest + int(round(bspan * avg))
+        wr, wg, wb, wa = _scale(r, g, b, amber, wdim)
+        dmx.set_12s(wr, wg, wb, wa, 255, strobe)
+
+
+def _layer_bar_flow(dmx: Any, layer: dict, t: float, state: dict) -> None:
+    """Continuous smooth flow across the bar — a soft blob of light glides
+    from zone to zone, crossfading instead of snapping.
+
+    Where bar_chase steps a hard head zone-to-zone, bar_flow moves a
+    *continuous* position and paints each zone by its distance from that
+    position through a raised-cosine falloff, so adjacent zones hand off
+    brightness smoothly (the "liquid" feel). `width` sets how many zones the
+    glow spans — wider = softer, more zones lit at once.
+
+    Speed: rate_hz (positions/sec) or rate_beats (BPM-locked) — same contract
+    as chase / bar_chase. A slow rate (≈0.5–1.5 positions/sec) reads as a calm
+    drifting glow; crank it for a fast sweep.
+
+    direction:
+      "wrap"     position loops 0→N continuously; the glow crosses the 1↔4
+                 seam without a visible edge.
+      "pingpong" position bounces end to end.
+    wash:
+      "off"      bar zones only (4 positions).
+      "match"    wash mirrors the brightest bar zone's level.
+      "include"  wash_1 / wash_2 become the end positions, so the glow flows
+                 left→right across the whole room (6 positions).
+    `colors` advances one slot per full pass.
+    """
+    colors = layer.get("colors") or [[255, 255, 255]]
+    if not colors:
+        colors = [[255, 255, 255]]
+    bpm = state.get("_bpm", FALLBACK_BPM)
+    rate_hz = _resolve_rate_hz(layer, bpm, default_hz=1.0)
+    direction = layer.get("direction", "wrap")
+    width = max(0.2, float(layer.get("width", 1.2)))
+    dim_active = int(layer.get("dim_active", 255))
+    dim_rest = int(layer.get("dim_rest", 0))
+    amber = layer.get("amber", 0)
+    strobe = _clamp(int(layer.get("strobe", 0)))
+    wash_mode = layer.get("wash", "off")
+    include_wash = wash_mode == "include"
+
+    n = 6 if include_wash else 4
+    phase = _advance_phase(state, t, rate_hz)
+
+    if direction == "pingpong":
+        period = 2 * (n - 1)
+        x = phase % period
+        head = x if x <= (n - 1) else period - x  # triangle 0..n-1..0
+        lap = int(phase // (n - 1))
+        wrap = False
+    else:
+        head = phase % n
+        lap = int(phase // n)
+        wrap = True
+
+    r, g, b = colors[lap % len(colors)][:3]
+    span = dim_active - dim_rest
+
+    levels = []
+    for zi in range(n):
+        d = abs(zi - head)
+        if wrap:
+            d = min(d, n - d)  # wrap distance so the blob crosses the seam
+        x = min(1.0, d / width)
+        levels.append(0.5 * (1.0 + math.cos(math.pi * x)))  # 1 at center → 0 at width
+
+    for zi in range(n):
+        dim = dim_rest + int(round(span * levels[zi]))
+        rr, gg, bb_, aa = _scale(r, g, b, amber, dim)
+        if include_wash:
+            _acid_paint_segment(dmx, zi, rr, gg, bb_, aa, strobe)
+        else:
+            dmx.set_bar_zone(zi + 1, rr, gg, bb_, aa, 255, strobe)
+
+    if not include_wash and wash_mode == "match":
+        peak = max(levels) if levels else 0.0
+        wdim = dim_rest + int(round(span * peak))
+        wr, wg, wb, wa = _scale(r, g, b, amber, wdim)
+        dmx.set_12s(wr, wg, wb, wa, 255, strobe)
+
+
 def _govee_signature(scene: dict) -> tuple:
     """Stable key for the Govee subset of a scene. update_scene() compares
     these to decide whether to re-fire Govee layers."""
@@ -523,7 +988,295 @@ DMX_LAYER_RENDERERS: dict[str, Callable[[Any, dict, float, dict], None]] = {
     "pulse": _layer_pulse,
     "strobe": _layer_strobe,
     "random_flash": _layer_random_flash,
+    "popcorn": _layer_popcorn,
+    "bar_shoot": _layer_bar_shoot,
+    "bar_flow": _layer_bar_flow,
+    "acid_kaleidoscope": _layer_acid_kaleidoscope,
+    "acid_bloom": _layer_acid_bloom,
 }
+
+
+# ---------------------------------------------------------------------------
+# Intensity transform
+# ---------------------------------------------------------------------------
+#
+# A single scalar `intensity ∈ [0, 1]` modulates how aggressive every DMX
+# layer reads. Declared layer values are treated as the i=1.0 ceiling — at
+# i=1 every scene plays exactly as authored, and i<1 attenuates a fixed set
+# of fields per layer type (brightness scales down, rates slow, strobe gates
+# off, event density drops).
+#
+# Govee layers (govee_rgb, govee_preset) are never touched: presets play
+# autonomously on-device and can't be smoothly modulated, and their LAN
+# rate-limit makes per-tick brightness changes impractical.
+#
+# A layer can opt out with `"intensify": false`, in which case the engine
+# passes it through unchanged regardless of the active intensity value.
+
+def _lerp(lo: float, hi: float, t: float) -> float:
+    return lo + (hi - lo) * t
+
+
+def _scale_value(value, lo_frac: float, i: float) -> float:
+    """value * lerp(lo_frac, 1.0, i). At i=1 returns value untouched."""
+    return value * _lerp(lo_frac, 1.0, i)
+
+
+def _scale_dim(value, lo_frac: float, i: float) -> int:
+    return int(round(_scale_value(value, lo_frac, i)))
+
+
+def _gamma_dim(value, i: float, gamma: float = 2.0) -> int:
+    """Brightness with perceptual curve: dim drops fast as i falls.
+    At i=1 returns value, at i=0.5 returns ~25% (gamma=2), at i=0 returns 0.
+    """
+    if i <= 0.0:
+        return 0
+    if i >= 1.0:
+        return int(round(value))
+    return int(round(value * (i ** gamma)))
+
+
+def _stretch(value, max_mult: float, i: float) -> float:
+    """For rate_beats / gap_s where bigger = slower. At i=0 returns
+    value*max_mult (much slower), at i=1 returns value untouched.
+    """
+    return value * _lerp(max_mult, 1.0, i)
+
+
+def _gate(value, threshold: float, i: float) -> float:
+    """Hold at 0 until i>=threshold, then ramp linearly to `value` at i=1."""
+    if i < threshold:
+        return 0.0
+    span = max(1e-6, 1.0 - threshold)
+    return value * ((i - threshold) / span)
+
+
+def _t_solid(layer, i):
+    out = dict(layer)
+    if "dim" in layer:
+        out["dim"] = _gamma_dim(layer["dim"], i, 2.0)
+    return out
+
+
+def _t_breathe(layer, i):
+    out = dict(layer)
+    if "dim_max" in layer:
+        out["dim_max"] = _gamma_dim(layer["dim_max"], i, 1.8)
+    if "hz" in layer:
+        out["hz"] = _scale_value(layer["hz"], 0.25, i)
+    return out
+
+
+def _t_chase(layer, i):
+    out = dict(layer)
+    if "dim_active" in layer:
+        out["dim_active"] = _gamma_dim(layer["dim_active"], i, 1.8)
+    rb = layer.get("rate_beats")
+    if isinstance(rb, (int, float)) and rb > 0:
+        # rate_beats: smaller = faster, so at low intensity we *stretch* it.
+        out["rate_beats"] = _stretch(rb, 4.0, i)
+    elif "rate_hz" in layer:
+        out["rate_hz"] = _scale_value(layer["rate_hz"], 0.20, i)
+    return out
+
+
+def _t_bar_chase(layer, i):
+    out = dict(layer)
+    if "dim_active" in layer:
+        out["dim_active"] = _gamma_dim(layer["dim_active"], i, 1.8)
+    rb = layer.get("rate_beats")
+    if isinstance(rb, (int, float)) and rb > 0:
+        out["rate_beats"] = _stretch(rb, 2.0, i)
+    elif "rate_hz" in layer:
+        out["rate_hz"] = _scale_value(layer["rate_hz"], 0.20, i)
+    if "tail" in layer:
+        out["tail"] = int(round(int(layer["tail"]) * (i ** 1.5)))
+    if layer.get("strobe"):
+        out["strobe"] = int(round(_gate(int(layer["strobe"]), 0.7, i)))
+    return out
+
+
+def _t_pulse(layer, i):
+    out = dict(layer)
+    # pulse dim is hard-gated below 0.15 — sparse pops should be silent at floor
+    if "dim" in layer:
+        if i < 0.15:
+            out["dim"] = 0
+        else:
+            out["dim"] = _gamma_dim(layer["dim"], i, 1.8)
+    pb = layer.get("period_beats")
+    if isinstance(pb, (int, float)) and pb > 0:
+        out["period_beats"] = _stretch(pb, 3.0, i)
+    elif "off_ms" in layer:
+        out["off_ms"] = int(round(int(layer["off_ms"]) * _lerp(3.0, 1.0, i)))
+    return out
+
+
+def _t_strobe(layer, i):
+    out = dict(layer)
+    rate = int(layer.get("rate", 0) or 0)
+    if rate > 0:
+        # strobe is the loudest knob — gate it off below i=0.6, then ramp.
+        out["rate"] = int(round(_gate(rate, 0.6, i)))
+    return out
+
+
+def _t_random_flash(layer, i):
+    out = dict(layer)
+    # below i=0.10, push gaps so wide the layer is effectively silent
+    if i < 0.10:
+        out["min_gap_s"] = 600.0
+        out["max_gap_s"] = 600.0
+        out["dim"] = 0
+        return out
+    if "min_gap_s" in layer:
+        out["min_gap_s"] = _stretch(float(layer["min_gap_s"]), 2.5, i)
+    if "max_gap_s" in layer:
+        out["max_gap_s"] = _stretch(float(layer["max_gap_s"]), 2.5, i)
+    if "dim" in layer:
+        out["dim"] = _gamma_dim(layer["dim"], i, 1.7)
+    return out
+
+
+def _t_popcorn(layer, i):
+    out = dict(layer)
+    if "flash_rate_hz" in layer:
+        out["flash_rate_hz"] = float(layer["flash_rate_hz"]) * _lerp(0.15, 1.0, i)
+    if "max_brightness" in layer:
+        out["max_brightness"] = _gamma_dim(layer["max_brightness"], i, 1.7)
+    if layer.get("strobe"):
+        out["strobe"] = int(round(_gate(int(layer["strobe"]), 0.7, i)))
+    return out
+
+
+def _t_wash_pingpong(layer, i):
+    out = dict(layer)
+    if "dim_active" in layer:
+        out["dim_active"] = _gamma_dim(layer["dim_active"], i, 1.8)
+    if "rate_hz" in layer:
+        out["rate_hz"] = _scale_value(layer["rate_hz"], 0.20, i)
+    return out
+
+
+def _t_wash_chase(layer, i):
+    out = dict(layer)
+    if "dim_max" in layer:
+        out["dim_max"] = _gamma_dim(layer["dim_max"], i, 1.8)
+    if "hz" in layer:
+        out["hz"] = _scale_value(layer["hz"], 0.25, i)
+    return out
+
+
+def _t_dual_wash(layer, i):
+    out = dict(layer)
+    if "dim" in layer:
+        out["dim"] = _gamma_dim(layer["dim"], i, 1.8)
+    return out
+
+
+def _t_bar_flow(layer, i):
+    out = dict(layer)
+    if "dim_active" in layer:
+        out["dim_active"] = _gamma_dim(layer["dim_active"], i, 1.8)
+    rb = layer.get("rate_beats")
+    if isinstance(rb, (int, float)) and rb > 0:
+        out["rate_beats"] = _stretch(rb, 4.0, i)
+    elif "rate_hz" in layer:
+        out["rate_hz"] = _scale_value(layer["rate_hz"], 0.20, i)
+    if layer.get("strobe"):
+        out["strobe"] = int(round(_gate(int(layer["strobe"]), 0.7, i)))
+    return out
+
+
+def _t_bar_shoot(layer, i):
+    out = dict(layer)
+    if "dim_active" in layer:
+        out["dim_active"] = _gamma_dim(layer["dim_active"], i, 1.8)
+    if "gap_ms" in layer:
+        # lower energy → longer rests between launches, so the shootout fires
+        # less often while the motion itself stays crisp.
+        out["gap_ms"] = int(round(_stretch(int(layer["gap_ms"]), 4.0, i)))
+    if layer.get("strobe"):
+        out["strobe"] = int(round(_gate(int(layer["strobe"]), 0.7, i)))
+    return out
+
+
+def _t_acid_kaleidoscope(layer, i):
+    out = dict(layer)
+    if "dim_max" in layer:
+        out["dim_max"] = _gamma_dim(layer["dim_max"], i, 1.8)
+    if "spin_dps" in layer:
+        out["spin_dps"] = _scale_value(layer["spin_dps"], 0.3, i)
+    return out
+
+
+def _t_acid_bloom(layer, i):
+    out = dict(layer)
+    if "base_dim" in layer:
+        out["base_dim"] = _gamma_dim(layer["base_dim"], i, 1.7)
+    if "spike_rate" in layer:
+        out["spike_rate"] = _scale_value(layer["spike_rate"], 0.2, i)
+    if "cannon_rate" in layer:
+        out["cannon_rate"] = _scale_value(layer["cannon_rate"], 0.2, i)
+    return out
+
+
+INTENSITY_TRANSFORMS: dict[str, Callable[[dict, float], dict]] = {
+    "solid": _t_solid,
+    "breathe": _t_breathe,
+    "chase": _t_chase,
+    "bar_chase": _t_bar_chase,
+    "pulse": _t_pulse,
+    "strobe": _t_strobe,
+    "random_flash": _t_random_flash,
+    "popcorn": _t_popcorn,
+    "wash_pingpong": _t_wash_pingpong,
+    "wash_chase": _t_wash_chase,
+    "dual_wash": _t_dual_wash,
+    "bar_shoot": _t_bar_shoot,
+    "bar_flow": _t_bar_flow,
+    "acid_kaleidoscope": _t_acid_kaleidoscope,
+    "acid_bloom": _t_acid_bloom,
+}
+
+
+def _enter_gate(layer: dict, intensity: float) -> Optional[float]:
+    """Intensity-gated layer entry — the "add-on" mechanism.
+
+    A layer with `enter_at: e` (0..1) renders nothing until the live intensity
+    reaches `e`, then fades in: the returned value is intensity remapped from
+    [e, 1] onto [0, 1], so the layer climbs from its own floor exactly as if the
+    build were starting there. Pass this result to _apply_intensity.
+
+    Returns None when the layer is below its entry threshold (skip rendering).
+    A layer with no `enter_at` (or enter_at <= 0) is a base layer — it plays
+    from the bottom and this returns the intensity unchanged.
+    """
+    e = layer.get("enter_at")
+    if not e:  # None or 0 -> base layer, ungated
+        return intensity
+    if intensity < e:
+        return None
+    return (intensity - e) / max(1e-6, 1.0 - e)
+
+
+def _apply_intensity(layer: dict, intensity: float) -> dict:
+    """Return a copy of `layer` with intensity-driven fields scaled.
+
+    Fast path: if intensity >= 1 or the layer opts out (`intensify: false`)
+    or has no transform, return the original dict — no allocation.
+    """
+    if intensity >= 1.0:
+        return layer
+    if layer.get("intensify") is False:
+        return layer
+    transform = INTENSITY_TRANSFORMS.get(layer.get("type"))
+    if transform is None:
+        return layer
+    if intensity < 0.0:
+        intensity = 0.0
+    return transform(layer, intensity)
 
 
 class SceneEngine:
@@ -535,7 +1288,14 @@ class SceneEngine:
     last painted state so a scene swap is glitch-free.
     """
 
-    def __init__(self, scene: dict, dmx, govee, bpm_fn: Optional[Callable[[], float]] = None) -> None:
+    def __init__(
+        self,
+        scene: dict,
+        dmx,
+        govee,
+        bpm_fn: Optional[Callable[[], float]] = None,
+        intensity_fn: Optional[Callable[[], float]] = None,
+    ) -> None:
         self.scene = scene
         self.dmx = dmx
         self.govee = govee
@@ -543,6 +1303,9 @@ class SceneEngine:
         # use rate_beats / period_beats divide BPM by their beats value to
         # get live Hz. None = fall through to FALLBACK_BPM (preview/tests).
         self.bpm_fn: Callable[[], float] = bpm_fn or (lambda: FALLBACK_BPM)
+        # intensity_fn returns 0..1. Mutates layer dicts pre-render via
+        # _apply_intensity. None / >=1 = scenes play exactly as authored.
+        self.intensity_fn: Callable[[], float] = intensity_fn or (lambda: 1.0)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         # Compiled DMX layers + per-layer state, swapped atomically by
@@ -623,7 +1386,10 @@ class SceneEngine:
         to_off = fleet_skus - referenced_skus
         if to_off:
             try:
-                self.govee.turn_skus(list(to_off), False)
+                # verify=True so a dropped LAN UDP packet doesn't leave a
+                # device (typically the COB strips) stuck lit on the previous
+                # scene's color while a DMX-only scene is running.
+                self.govee.turn_skus(list(to_off), False, verify=True)
             except Exception as e:
                 print(f"[scene_engine] govee turn off {sorted(to_off)} failed: {e}", flush=True)
 
@@ -703,14 +1469,25 @@ class SceneEngine:
             if not (bpm > 0):
                 bpm = FALLBACK_BPM
             try:
+                intensity = float(self.intensity_fn())
+            except Exception:
+                intensity = 1.0
+            if intensity != intensity:  # NaN guard
+                intensity = 1.0
+            intensity = max(0.0, min(1.0, intensity))
+            try:
                 self.dmx.blackout()
                 for layer, state in zip(layers, states):
                     renderer = DMX_LAYER_RENDERERS.get(layer["type"])
                     if renderer is None:
                         continue
                     state["_bpm"] = bpm
+                    state["_intensity"] = intensity
+                    local_i = _enter_gate(layer, intensity)
+                    if local_i is None:
+                        continue  # add-on layer below its enter_at threshold
                     try:
-                        renderer(self.dmx, layer, t, state)
+                        renderer(self.dmx, _apply_intensity(layer, local_i), t, state)
                     except Exception as e:
                         print(f"[scene_engine] layer {layer.get('type')} failed: {e}", flush=True)
                 self.dmx.send_frame()
@@ -747,7 +1524,14 @@ def validate_scene(scene: dict) -> list[str]:
             tgt = layer.get("target")
             if tgt not in DMX_TARGETS:
                 errors.append(f"layer {i} ({ltype}): invalid target {tgt!r}")
-        if ltype in {"chase", "bar_chase"}:
+        if ltype == "popcorn":
+            tgt = layer.get("target")
+            if tgt not in POPCORN_UNIT_MAP:
+                errors.append(
+                    f"layer {i} (popcorn): invalid target {tgt!r}; "
+                    f"must be one of {sorted(POPCORN_UNIT_MAP)}"
+                )
+        if ltype in {"chase", "bar_chase", "bar_flow"}:
             has_hz = "rate_hz" in layer
             has_beats = "rate_beats" in layer and (layer.get("rate_beats") or 0) > 0
             if has_hz and has_beats:

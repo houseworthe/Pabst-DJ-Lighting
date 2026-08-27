@@ -43,7 +43,7 @@ Keep these in mind any time you touch `vcdj.py`:
 | Pin the vcdj keepalive/broadcast socket to the right NIC via `IP_BOUND_IF = 25` on macOS | macOS can have two link-local routes (en0 + en8); without `IP_BOUND_IF`, broadcasts leave the wrong NIC. |
 | If you add new outbound sockets, set `SO_REUSEADDR + SO_REUSEPORT` | `status_sock` at 50002 can otherwise collide with probes/test scripts. |
 
-See also: `dj-lights-mvp2/README.md` (running + dashboard) and code comments in `vcdj.py` / `prodj.py` that call out each rule inline.
+See also: `dj-lights/README.md` (running + dashboard) and code comments in `vcdj.py` / `prodj.py` that call out each rule inline.
 
 ---
 
@@ -111,7 +111,7 @@ Make XDJ-XZ v1.24 actually accept our packet so it starts sending status back on
    ```
 3. Terminal B:
    ```bash
-   cd /Users/ethanhouseworth/Documents/Personal-Projects/dj-lighting-ultron
+   cd ~/dev/dj-lighting-ultron
    .venv/bin/python /tmp/prodj_probe.py
    ```
 4. When prompted, press PLAY on deck 1.
@@ -122,7 +122,7 @@ Make XDJ-XZ v1.24 actually accept our packet so it starts sending status back on
 
 ## Key files
 
-- [dj-lights-mvp2/main.py](dj-lights-mvp2/main.py) — Pro DJ Link consumer + mode dispatcher. Interface is `169.254.160.162` (verify with `ifconfig en8` — may drift on reboot).
+- [dj-lights/main.py](dj-lights/main.py) — Pro DJ Link consumer + mode dispatcher. Interface is `169.254.160.162` (verify with `ifconfig en8` — may drift on reboot).
 - [dj-lights/python-prodj-link/prodj/core/vcdj.py](dj-lights/python-prodj-link/prodj/core/vcdj.py) — the fix lives here. `send_status_packet` (line 82) builds via `packets.StatusPacket`, unicasts every 200ms. Run-loop uses `status_interval=0.2` with keepalive every 8th tick. Already heavily diverged from upstream.
 - [dj-lights/python-prodj-link/prodj/network/packets.py](dj-lights/python-prodj-link/prodj/network/packets.py) — `StatusPacket` construct. `MacAddrAdapter` requires MAC as string `"aa:bb:cc:dd:ee:ff"`, not a list (line 16).
 - [dj-lights/python-prodj-link/prodj/core/prodj.py](dj-lights/python-prodj-link/prodj/core/prodj.py:45) — where `status_sock` is created at 0.0.0.0:50002. Needs SO_REUSEADDR/REUSEPORT if you add a dedicated bound-to-interface send sock.
@@ -139,7 +139,7 @@ Make XDJ-XZ v1.24 actually accept our packet so it starts sending status back on
 
 - DMX: 2x Tetra 12 @ D001 + Tetra Bar @ D008 via VenueLink wireless (universe C7/white on both dongles). `dj-lights/dmx_controller.py test` cycles all fixtures.
 - Govee: 8 devices cached, 4x H61E5 strips on LAN (~10ms), 4x H6010 bulbs on cloud (~200-500ms). CLI at `~/.local/bin/govee`.
-- Scenes: mapped per mode in [dj-lights-mvp2/direct_lights.py:29](dj-lights-mvp2/direct_lights.py:29). Tested end-to-end.
+- Scenes: mapped per mode in [dj-lights/direct_lights.py:29](dj-lights/direct_lights.py:29). Tested end-to-end.
 - `direct_lights.apply_mode(mode)` is the integration point — once status packets work, existing PSSI → mode logic in `main.py` will drive it.
 
-Once the packet fix lands, run `.venv/bin/python dj-lights-mvp2/main.py` with a track loaded and watch `[track] ... phrases` and `[mode] ... -> drop` log lines start flowing.
+Once the packet fix lands, run `.venv/bin/python dj-lights/main.py` with a track loaded and watch `[track] ... phrases` and `[mode] ... -> drop` log lines start flowing.
