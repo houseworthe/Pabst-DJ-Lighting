@@ -1,6 +1,6 @@
 <div align="center">
 
-# dj-lighting-ultron
+# Pabst-DJ-Lighting
 
 **Phrase-aware DJ lighting. The decks drive the rig.**
 
